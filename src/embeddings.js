@@ -8,6 +8,9 @@
  *      * dimensions -> 768 (default) or client-provided 256/512/768
  *  - Fan out batched inputs (array of strings) into one upstream call per string.
  *  - Merge per-item responses into a single OpenAI-shaped response.
+ *  - Retry upstream HTTP 429 responses with exponential backoff (1s, doubling,
+ *    capped at 60s); if a retry following a full 60s wait still returns 429,
+ *    the whole request fails with 429.
  *
  * The module is pure and framework-agnostic: `fetch` is injected so the
  * merge/split logic can be unit tested without real network calls.
@@ -37,10 +40,14 @@ export class ValidationError extends Error {
   }
 }
 
-const DEFAULT_CONCURRENCY = 4;
+const DEFAULT_CONCURRENCY = 1;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_DIMENSIONS = 768;
 const ALLOWED_DIMENSIONS = [256, 512, 768];
+
+// 429 retry schedule: exponential doubling starting at 1s, capped at 60s.
+const RETRY_INITIAL_DELAY_MS = 1_000;
+const RETRY_MAX_DELAY_MS = 60_000;
 
 /**
  * Builds the config object consumed by createProxy().
@@ -215,6 +222,50 @@ export async function callUpstream(upstreamBody, config, fetchImpl = globalThis.
 }
 
 /**
+ * Runs a single upstream call, retrying HTTP 429 responses with exponential
+ * backoff. Delays double from 1s up to a 60s cap (1s, 2s, 4s, 8s, 16s, 32s,
+ * 60s). If a retry that followed a full 60s wait still returns 429, the last
+ * UpstreamError (status 429) is thrown — the caller fails the whole request.
+ *
+ * Non-429 errors (UpstreamError with any other status) and UpstreamNetworkError
+ * propagate immediately without retrying.
+ *
+ * @param {object} upstreamBody body to send to Yandex
+ * @param {object} config
+ * @param {typeof fetch} [fetchImpl]
+ * @param {(ms: number) => Promise<void>} [sleepImpl] delay function, injected for tests
+ * @returns {Promise<object>} parsed JSON response
+ */
+export async function callUpstreamWithRetry(
+  upstreamBody,
+  config,
+  fetchImpl = globalThis.fetch,
+  sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+) {
+  let delayMs = RETRY_INITIAL_DELAY_MS;
+  let lastDelayWasMax = false;
+
+  for (;;) {
+    try {
+      return await callUpstream(upstreamBody, config, fetchImpl);
+    } catch (err) {
+      if (!(err instanceof UpstreamError) || err.status !== 429) {
+        throw err;
+      }
+      // A 429 that follows the full 60s wait means we are rate-limited even
+      // after backoff: fail the whole request with the 429.
+      if (lastDelayWasMax) {
+        throw err;
+      }
+      // 429: wait, then retry (1s, 2s, 4s, ..., capped at 60s).
+      await sleepImpl(delayMs);
+      lastDelayWasMax = delayMs >= RETRY_MAX_DELAY_MS;
+      delayMs = Math.min(delayMs * 2, RETRY_MAX_DELAY_MS);
+    }
+  }
+}
+
+/**
  * Maps over items with a bounded number of concurrent workers, preserving order.
  * @template T, R
  * @param {T[]} items
@@ -299,9 +350,9 @@ export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch
   const upstreamBody = buildUpstreamBody(body, config.folderId);
   const inputs = normalizeInput(body.input);
 
-  // Fan out: one upstream call per input string.
+  // Fan out: one upstream call per input string, each retrying 429s.
   const responses = await mapWithConcurrency(inputs, config.concurrency, (text) =>
-    callUpstream({ ...upstreamBody, input: text }, config, fetchImpl)
+    callUpstreamWithRetry({ ...upstreamBody, input: text }, config, fetchImpl)
   );
 
   return mergeResponses(responses);

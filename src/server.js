@@ -12,10 +12,12 @@
  *   - dimensions forced to the client value (256/512/768) or 768 if absent
  *
  * Batched inputs (arrays of strings) are fanned out into one upstream call per
- * string and merged back into a single OpenAI-shaped response.
+ * string and merged back into a single OpenAI-shaped response. Upstream HTTP
+ * 429 responses are retried with exponential backoff (1s doubling, capped at
+ * 60s); if still rate-limited after the full 60s wait, the request fails 429.
  *
  * Env vars: YANDEX_API_KEY, YANDEX_FOLDER_ID, PORT (default 9988),
- * YANDEX_BASE_URL (optional), YANDEX_CONCURRENCY (default 4),
+ * YANDEX_BASE_URL (optional), YANDEX_CONCURRENCY (default 1),
  * YANDEX_TIMEOUT_MS (default 60000).
  */
 

@@ -10,6 +10,7 @@ import {
   buildConfig,
   buildUpstreamBody,
   callUpstream,
+  callUpstreamWithRetry,
   mapWithConcurrency,
   mergeResponses,
   normalizeDimensions,
@@ -41,7 +42,7 @@ test('buildConfig reads env vars and applies defaults', () => {
   assert.equal(config.apiKey, 'test-key');
   assert.equal(config.folderId, 'folder-1');
   assert.equal(config.baseUrl, 'https://ai.api.cloud.yandex.net/v1');
-  assert.equal(config.concurrency, 4);
+  assert.equal(config.concurrency, 1);
   assert.equal(config.timeoutMs, 60000);
 });
 
@@ -230,6 +231,86 @@ test('callUpstream throws UpstreamNetworkError when fetch itself fails', async (
       callUpstream({}, { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 }, fakeFetch),
     UpstreamNetworkError
   );
+});
+
+// ---------------------------------------------------------------------------
+// callUpstreamWithRetry (429 backoff)
+// ---------------------------------------------------------------------------
+
+test('callUpstreamWithRetry retries 429 with exponential backoff then succeeds', async () => {
+  let calls = 0;
+  const delays = [];
+  const fakeFetch = async () => {
+    calls += 1;
+    if (calls <= 2) {
+      return jsonResponse(429, { error: { message: 'rate limited' } });
+    }
+    return jsonResponse(200, { data: [], usage: {} });
+  };
+  const sleepImpl = async (ms) => {
+    delays.push(ms);
+  };
+
+  const result = await callUpstreamWithRetry(
+    { model: 'm', input: 'x' },
+    { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+    fakeFetch,
+    sleepImpl
+  );
+
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [1000, 2000]);
+  assert.deepEqual(result, { data: [], usage: {} });
+});
+
+test('callUpstreamWithRetry gives up with 429 after 1s,2s,4s,...,60s schedule', async () => {
+  const delays = [];
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return jsonResponse(429, { error: { message: 'still limited' } });
+  };
+  const sleepImpl = async (ms) => {
+    delays.push(ms);
+  };
+
+  await assert.rejects(
+    () =>
+      callUpstreamWithRetry(
+        { model: 'm', input: 'x' },
+        { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+        fakeFetch,
+        sleepImpl
+      ),
+    (err) => err instanceof UpstreamError && err.status === 429
+  );
+
+  // 7 sleeps (1s, 2s, 4s, 8s, 16s, 32s, 60s), then the 8th call's 429 throws.
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 32000, 60000]);
+  assert.equal(calls, 8);
+});
+
+test('callUpstreamWithRetry does not retry non-429 upstream errors', async () => {
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return jsonResponse(500, { error: { message: 'boom' } });
+  };
+  const sleepImpl = async () => {
+    assert.fail('should not sleep for a non-429 error');
+  };
+
+  await assert.rejects(
+    () =>
+      callUpstreamWithRetry(
+        { model: 'm', input: 'x' },
+        { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+        fakeFetch,
+        sleepImpl
+      ),
+    (err) => err instanceof UpstreamError && err.status === 500
+  );
+  assert.equal(calls, 1);
 });
 
 // ---------------------------------------------------------------------------

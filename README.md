@@ -20,6 +20,9 @@ embeddings from Yandex `text-embeddings-v2-doc` without changing your applicatio
 - **Batch fan-out:** an `input` array of N strings is split into N upstream calls
   (one string each, concurrency-limited) and the responses are merged back into a
   single OpenAI-shaped response with re-indexed `data` and summed `usage`.
+- **429 retry:** upstream rate-limit responses (`429`) are retried with
+  exponential backoff (`1s → 2s → 4s → 8s → 16s → 32s → 60s`, capped); if a retry
+  following the full 60s wait still returns `429`, the whole request fails with `429`.
 
 ## Requirements
 
@@ -55,7 +58,7 @@ Startup validation: the process exits with a clear message if `YANDEX_API_KEY` o
 | `YANDEX_FOLDER_ID` | ✅ | — | Folder id used to build `emb://<id>/text-embeddings-v2-doc/latest` |
 | `PORT` | — | `9988` | Port the proxy listens on |
 | `YANDEX_BASE_URL` | — | `https://ai.api.cloud.yandex.net/v1` | Upstream base URL (trailing slash stripped) |
-| `YANDEX_CONCURRENCY` | — | `4` | Max simultaneous upstream calls during batch fan-out |
+| `YANDEX_CONCURRENCY` | — | `1` | Max simultaneous upstream calls during batch fan-out |
 | `YANDEX_TIMEOUT_MS` | — | `60000` | Upstream request timeout |
 
 ## Usage
@@ -118,10 +121,14 @@ Given `input: ["a", "b", "c"]`, the proxy:
 
 1. Validates the body (strings only; token arrays are rejected with a 400).
 2. Makes **3 upstream calls** to `/v1/embeddings`, each with `input: "a"`, `"b"`, `"c"`
-   respectively, at most `YANDEX_CONCURRENCY` (default 4) at a time.
+   respectively, at most `YANDEX_CONCURRENCY` (default 1) at a time.
 3. Merges the responses: `data` entries are re-indexed `0..N-1` in original order and
    `usage` token counters are summed.
 4. Returns a single OpenAI-shaped response.
+
+Upstream `429` responses are retried with exponential backoff (`1s` doubling, capped
+at `60s`). If a retry following the full 60s wait still returns `429`, the whole
+request fails with a `429` (worst case ~2 minutes per upstream call).
 
 A single-string `input` is forwarded as-is (one upstream call).
 
@@ -132,6 +139,7 @@ A single-string `input` is forwarded as-is (one upstream call).
 | Invalid body / unsupported `input` | `400` OpenAI-style error |
 | Unsupported `dimensions` (not 256/512/768) | `400` OpenAI-style error |
 | Upstream returns an HTTP error | Upstream status + error body forwarded |
+| Upstream `429` rate limit | Retried with backoff `1s → 60s` (capped); if still `429` after the full 60s wait, `429` returned to the client |
 | Upstream unreachable / timeout | `502` `upstream_network_error` |
 | Any other path | `404` |
 
