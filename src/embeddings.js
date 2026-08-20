@@ -6,7 +6,8 @@
  *      * model  -> emb://{folderId}/text-embeddings-v2-doc/latest
  *      * encoding_format -> "float"
  *      * dimensions -> 768 (default) or client-provided 256/512/768
- *  - Fan out batched inputs (array of strings) into one upstream call per string.
+ *  - Sequentially process batched inputs (array of strings): one upstream call
+ *    per string, one at a time, in order.
  *  - Merge per-item responses into a single OpenAI-shaped response.
  *  - Retry upstream HTTP 429 responses with exponential backoff (1s, doubling,
  *    capped at 60s); if a retry following a full 60s wait still returns 429,
@@ -40,7 +41,6 @@ export class ValidationError extends Error {
   }
 }
 
-const DEFAULT_CONCURRENCY = 1;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_DIMENSIONS = 768;
 const ALLOWED_DIMENSIONS = [256, 512, 768];
@@ -58,7 +58,6 @@ export function buildConfig(env = process.env) {
   const apiKey = (env.YANDEX_API_KEY || '').trim();
   const folderId = (env.YANDEX_FOLDER_ID || '').trim();
   const baseUrl = (env.YANDEX_BASE_URL || 'https://ai.api.cloud.yandex.net/v1').replace(/\/+$/, '');
-  const concurrency = Number.parseInt(env.YANDEX_CONCURRENCY, 10) || DEFAULT_CONCURRENCY;
   const timeoutMs = Number.parseInt(env.YANDEX_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS;
 
   if (!apiKey) {
@@ -68,7 +67,7 @@ export function buildConfig(env = process.env) {
     throw new Error('Environment variable YANDEX_FOLDER_ID is required');
   }
 
-  return { apiKey, folderId, baseUrl, concurrency, timeoutMs };
+  return { apiKey, folderId, baseUrl, timeoutMs };
 }
 
 /**
@@ -266,31 +265,6 @@ export async function callUpstreamWithRetry(
 }
 
 /**
- * Maps over items with a bounded number of concurrent workers, preserving order.
- * @template T, R
- * @param {T[]} items
- * @param {number} limit
- * @param {(item: T, index: number) => Promise<R>} fn
- * @returns {Promise<R[]>}
- */
-export async function mapWithConcurrency(items, limit, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-
-  async function worker() {
-    while (next < items.length) {
-      const i = next;
-      next += 1;
-      results[i] = await fn(items[i], i);
-    }
-  }
-
-  const workerCount = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
-}
-
-/**
  * Merges N single-item embeddings responses into one OpenAI-shaped response:
  *  - `data` re-indexed 0..N-1 in original order
  *  - `usage` token counters summed
@@ -341,6 +315,10 @@ export function mergeResponses(responses) {
 /**
  * Orchestrates the whole proxy flow for one incoming embeddings request.
  *
+ * Processes batched inputs strictly sequentially: one upstream call per input
+ * string, awaiting each response before starting the next, so a batch of N
+ * strings takes N sequential calls (order preserved). Each call retries 429s.
+ *
  * @param {object} body client request body
  * @param {object} config result of buildConfig()
  * @param {typeof fetch} [fetchImpl]
@@ -350,10 +328,16 @@ export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch
   const upstreamBody = buildUpstreamBody(body, config.folderId);
   const inputs = normalizeInput(body.input);
 
-  // Fan out: one upstream call per input string, each retrying 429s.
-  const responses = await mapWithConcurrency(inputs, config.concurrency, (text) =>
-    callUpstreamWithRetry({ ...upstreamBody, input: text }, config, fetchImpl)
-  );
+  // Sequential loop: one upstream call per input string, awaiting each one.
+  const responses = [];
+  for (const text of inputs) {
+    const response = await callUpstreamWithRetry(
+      { ...upstreamBody, input: text },
+      config,
+      fetchImpl
+    );
+    responses.push(response);
+  }
 
   return mergeResponses(responses);
 }

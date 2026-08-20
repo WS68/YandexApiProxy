@@ -17,9 +17,9 @@ embeddings from Yandex `text-embeddings-v2-doc` without changing your applicatio
 - Forces `encoding_format: "float"` in the outgoing body.
 - Forwards `dimensions` if present — must be `256`, `512` or `768`, otherwise the
   request is rejected with a `400` — and defaults to `768` when absent.
-- **Batch fan-out:** an `input` array of N strings is split into N upstream calls
-  (one string each, concurrency-limited) and the responses are merged back into a
-  single OpenAI-shaped response with re-indexed `data` and summed `usage`.
+- **Batch processing:** an `input` array of N strings is processed as N upstream
+  calls (one string each, strictly sequential) and the responses are merged back
+  into a single OpenAI-shaped response with re-indexed `data` and summed `usage`.
 - **429 retry:** upstream rate-limit responses (`429`) are retried with
   exponential backoff (`1s → 2s → 4s → 8s → 16s → 32s → 60s`, capped); if a retry
   following the full 60s wait still returns `429`, the whole request fails with `429`.
@@ -58,7 +58,6 @@ Startup validation: the process exits with a clear message if `YANDEX_API_KEY` o
 | `YANDEX_FOLDER_ID` | ✅ | — | Folder id used to build `emb://<id>/text-embeddings-v2-doc/latest` |
 | `PORT` | — | `9988` | Port the proxy listens on |
 | `YANDEX_BASE_URL` | — | `https://ai.api.cloud.yandex.net/v1` | Upstream base URL (trailing slash stripped) |
-| `YANDEX_CONCURRENCY` | — | `1` | Max simultaneous upstream calls during batch fan-out |
 | `YANDEX_TIMEOUT_MS` | — | `60000` | Upstream request timeout |
 
 ## Usage
@@ -115,13 +114,13 @@ res = client.embeddings.create(
 print([d.index for d in res.data])    # [0, 1]
 ```
 
-## How batch fan-out works
+## How batch processing works
 
 Given `input: ["a", "b", "c"]`, the proxy:
 
 1. Validates the body (strings only; token arrays are rejected with a 400).
-2. Makes **3 upstream calls** to `/v1/embeddings`, each with `input: "a"`, `"b"`, `"c"`
-   respectively, at most `YANDEX_CONCURRENCY` (default 1) at a time.
+2. Makes **3 upstream calls** to `/v1/embeddings`, each with `input: "a"`, `"b"`, `"c"`,
+   strictly sequentially (each call is awaited before the next starts).
 3. Merges the responses: `data` entries are re-indexed `0..N-1` in original order and
    `usage` token counters are summed.
 4. Returns a single OpenAI-shaped response.

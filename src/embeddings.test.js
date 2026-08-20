@@ -11,7 +11,6 @@ import {
   buildUpstreamBody,
   callUpstream,
   callUpstreamWithRetry,
-  mapWithConcurrency,
   mergeResponses,
   normalizeDimensions,
   normalizeInput,
@@ -42,7 +41,6 @@ test('buildConfig reads env vars and applies defaults', () => {
   assert.equal(config.apiKey, 'test-key');
   assert.equal(config.folderId, 'folder-1');
   assert.equal(config.baseUrl, 'https://ai.api.cloud.yandex.net/v1');
-  assert.equal(config.concurrency, 1);
   assert.equal(config.timeoutMs, 60000);
 });
 
@@ -51,11 +49,9 @@ test('buildConfig honors overrides and trims trailing slash', () => {
     YANDEX_API_KEY: 'k',
     YANDEX_FOLDER_ID: 'f',
     YANDEX_BASE_URL: 'https://example.com/v1/',
-    YANDEX_CONCURRENCY: '8',
     YANDEX_TIMEOUT_MS: '5000',
   });
   assert.equal(config.baseUrl, 'https://example.com/v1');
-  assert.equal(config.concurrency, 8);
   assert.equal(config.timeoutMs, 5000);
 });
 
@@ -314,34 +310,6 @@ test('callUpstreamWithRetry does not retry non-429 upstream errors', async () =>
 });
 
 // ---------------------------------------------------------------------------
-// mapWithConcurrency
-// ---------------------------------------------------------------------------
-
-test('mapWithConcurrency preserves order and bounds concurrency', async () => {
-  let active = 0;
-  let maxActive = 0;
-  const seen = [];
-
-  const fn = async (item, index) => {
-    active += 1;
-    maxActive = Math.max(maxActive, active);
-    await new Promise((r) => setTimeout(r, 5));
-    active -= 1;
-    seen.push(index);
-    return item.toUpperCase();
-  };
-
-  const results = await mapWithConcurrency(
-    ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
-    3,
-    fn
-  );
-
-  assert.deepEqual(results, ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']);
-  assert.equal(maxActive, 3);
-});
-
-// ---------------------------------------------------------------------------
 // mergeResponses
 // ---------------------------------------------------------------------------
 
@@ -389,10 +357,10 @@ test('mergeResponses throws on empty input', () => {
 });
 
 // ---------------------------------------------------------------------------
-// proxyEmbeddings (integration of split + fan-out + merge with fake fetch)
+// proxyEmbeddings (integration of split + sequential loop + merge with fake fetch)
 // ---------------------------------------------------------------------------
 
-test('proxyEmbeddings fans out array input and merges results', async () => {
+test('proxyEmbeddings processes array input sequentially and merges results', async () => {
   const calls = [];
   const seenDimensions = [];
   const fakeFetch = async (url, opts) => {
@@ -410,7 +378,6 @@ test('proxyEmbeddings fans out array input and merges results', async () => {
     baseUrl: 'https://ai.api.cloud.yandex.net/v1',
     apiKey: 'k',
     folderId: 'folder-9',
-    concurrency: 2,
     timeoutMs: 1000,
   };
 
@@ -439,7 +406,44 @@ test('proxyEmbeddings fans out array input and merges results', async () => {
   assert.equal(result.model, 'emb://folder-9/text-embeddings-v2-doc/latest');
 });
 
-test('proxyEmbeddings forwards a single string unchanged (no fan-out)', async () => {
+test('proxyEmbeddings makes strictly sequential upstream calls (no overlap)', async () => {
+  let active = 0;
+  let maxActive = 0;
+  const callOrder = [];
+  const fakeFetch = async (_url, opts) => {
+    const body = JSON.parse(opts.body);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    callOrder.push(body.input);
+    await new Promise((r) => setTimeout(r, 5));
+    active -= 1;
+    return jsonResponse(200, {
+      data: [{ object: 'embedding', embedding: [1], index: 0 }],
+      usage: { prompt_tokens: 1, total_tokens: 1 },
+      model: body.model,
+    });
+  };
+
+  const config = {
+    baseUrl: 'https://b',
+    apiKey: 'k',
+    folderId: 'f',
+    timeoutMs: 1000,
+  };
+
+  const result = await proxyEmbeddings(
+    { model: 'x', input: ['one', 'two', 'three'] },
+    config,
+    fakeFetch
+  );
+
+  assert.equal(callOrder.length, 3);
+  assert.deepEqual(callOrder, ['one', 'two', 'three']);
+  assert.equal(maxActive, 1, 'upstream calls must never overlap');
+  assert.equal(result.data.length, 3);
+});
+
+test('proxyEmbeddings forwards a single string unchanged (single upstream call)', async () => {
   let callCount = 0;
   let sentBody = null;
   const fakeFetch = async (_url, opts) => {
@@ -456,7 +460,6 @@ test('proxyEmbeddings forwards a single string unchanged (no fan-out)', async ()
     baseUrl: 'https://b',
     apiKey: 'k',
     folderId: 'f',
-    concurrency: 4,
     timeoutMs: 1000,
   };
 
@@ -475,7 +478,6 @@ test('proxyEmbeddings propagates a single upstream failure', async () => {
     baseUrl: 'https://b',
     apiKey: 'k',
     folderId: 'f',
-    concurrency: 2,
     timeoutMs: 1000,
   };
 
