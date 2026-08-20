@@ -15,6 +15,8 @@ embeddings from Yandex `text-embeddings-v2-doc` without changing your applicatio
   (the client's own key is ignored, so any dummy value works client-side).
 - Rewrites `model` to `emb://$YANDEX_FOLDER_ID/text-embeddings-v2-doc/latest`.
 - Forces `encoding_format: "float"` in the outgoing body.
+- Forwards `dimensions` if present — must be `256`, `512` or `768`, otherwise the
+  request is rejected with a `400` — and defaults to `768` when absent.
 - **Batch fan-out:** an `input` array of N strings is split into N upstream calls
   (one string each, concurrency-limited) and the responses are merged back into a
   single OpenAI-shaped response with re-indexed `data` and summed `usage`.
@@ -128,6 +130,7 @@ A single-string `input` is forwarded as-is (one upstream call).
 | Situation | Response |
 |---|---|
 | Invalid body / unsupported `input` | `400` OpenAI-style error |
+| Unsupported `dimensions` (not 256/512/768) | `400` OpenAI-style error |
 | Upstream returns an HTTP error | Upstream status + error body forwarded |
 | Upstream unreachable / timeout | `502` `upstream_network_error` |
 | Any other path | `404` |
@@ -146,4 +149,6 @@ npm run dev       # start with --watch
 - Only `POST /v1/embeddings` (and `/embeddings`) is proxied; other OpenAI endpoints
   are intentionally not forwarded (single-purpose proxy).
 - `encoding_format` is always forced to `"float"` — `"base64"` is not supported.
+- `dimensions` is validated against `256`, `512` and `768` and defaults to `768`
+  when the client does not send it; any other value is rejected with a `400`.
 - Yandex document embeddings produce 1024-dimensional float vectors.

@@ -12,6 +12,7 @@ import {
   callUpstream,
   mapWithConcurrency,
   mergeResponses,
+  normalizeDimensions,
   normalizeInput,
   proxyEmbeddings,
   UpstreamError,
@@ -94,6 +95,37 @@ test('normalizeInput rejects token arrays (numbers)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// normalizeDimensions
+// ---------------------------------------------------------------------------
+
+test('normalizeDimensions defaults to 768 when absent or null', () => {
+  assert.equal(normalizeDimensions(undefined), 768);
+  assert.equal(normalizeDimensions(null), 768);
+});
+
+test('normalizeDimensions accepts 256, 512 and 768', () => {
+  assert.equal(normalizeDimensions(256), 256);
+  assert.equal(normalizeDimensions(512), 512);
+  assert.equal(normalizeDimensions(768), 768);
+});
+
+test('normalizeDimensions rejects unsupported or non-integer values', () => {
+  for (const bad of [0, 128, 300, 1024, 256.5, NaN, '512', true, [], {}]) {
+    assert.throws(() => normalizeDimensions(bad), ValidationError);
+  }
+});
+
+test('normalizeDimensions errors carry the param "dimensions"', () => {
+  try {
+    normalizeDimensions(300);
+    assert.fail('expected ValidationError');
+  } catch (err) {
+    assert.ok(err instanceof ValidationError);
+    assert.equal(err.param, 'dimensions');
+  }
+});
+
+// ---------------------------------------------------------------------------
 // buildUpstreamBody
 // ---------------------------------------------------------------------------
 
@@ -114,6 +146,27 @@ test('buildUpstreamBody overrides a client-provided encoding_format', () => {
     'f'
   );
   assert.equal(body.encoding_format, 'float');
+});
+
+test('buildUpstreamBody injects dimensions 768 by default', () => {
+  const body = buildUpstreamBody({ model: 'x', input: 'a' }, 'f');
+  assert.equal(body.dimensions, 768);
+});
+
+test('buildUpstreamBody forwards a valid client dimensions value', () => {
+  assert.equal(buildUpstreamBody({ input: 'a', dimensions: 256 }, 'f').dimensions, 256);
+  assert.equal(buildUpstreamBody({ input: 'a', dimensions: 512 }, 'f').dimensions, 512);
+});
+
+test('buildUpstreamBody rejects an unsupported dimensions value', () => {
+  assert.throws(
+    () => buildUpstreamBody({ model: 'x', input: 'a', dimensions: 300 }, 'f'),
+    (err) => err instanceof ValidationError && err.param === 'dimensions'
+  );
+  assert.throws(
+    () => buildUpstreamBody({ model: 'x', input: 'a', dimensions: '512' }, 'f'),
+    ValidationError
+  );
 });
 
 test('buildUpstreamBody rejects missing input', () => {
@@ -260,9 +313,11 @@ test('mergeResponses throws on empty input', () => {
 
 test('proxyEmbeddings fans out array input and merges results', async () => {
   const calls = [];
+  const seenDimensions = [];
   const fakeFetch = async (url, opts) => {
     const body = JSON.parse(opts.body);
     calls.push(body.input);
+    seenDimensions.push(body.dimensions);
     return jsonResponse(200, {
       data: [{ object: 'embedding', embedding: [body.input.length], index: 0 }],
       usage: { prompt_tokens: body.input.length, total_tokens: body.input.length },
@@ -284,8 +339,9 @@ test('proxyEmbeddings fans out array input and merges results', async () => {
     fakeFetch
   );
 
-  // one upstream call per input string
+  // one upstream call per input string, each carrying the default dimensions
   assert.deepEqual(calls, ['ab', 'cd', 'ef']);
+  assert.deepEqual(seenDimensions, [768, 768, 768]);
   // merged response
   assert.equal(result.data.length, 3);
   assert.deepEqual(

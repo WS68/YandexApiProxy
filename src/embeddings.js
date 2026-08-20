@@ -5,6 +5,7 @@
  *  - Rewrite the client's embeddings request into a Yandex AI request:
  *      * model  -> emb://{folderId}/text-embeddings-v2-doc/latest
  *      * encoding_format -> "float"
+ *      * dimensions -> 768 (default) or client-provided 256/512/768
  *  - Fan out batched inputs (array of strings) into one upstream call per string.
  *  - Merge per-item responses into a single OpenAI-shaped response.
  *
@@ -38,6 +39,8 @@ export class ValidationError extends Error {
 
 const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_DIMENSIONS = 768;
+const ALLOWED_DIMENSIONS = [256, 512, 768];
 
 /**
  * Builds the config object consumed by createProxy().
@@ -116,11 +119,39 @@ export function normalizeInput(input) {
 }
 
 /**
+ * Validates and normalizes the `dimensions` field of an embeddings request.
+ * Absent (`undefined`) or `null` resolves to the Yandex default (768).
+ * Otherwise the value must be an integer in [256, 512, 768].
+ *
+ * @param {unknown} dimensions client-provided value (may be undefined)
+ * @returns {number} normalized dimension size
+ * @throws {ValidationError} when `dimensions` is present but invalid
+ */
+export function normalizeDimensions(dimensions) {
+  if (dimensions === undefined || dimensions === null) {
+    return DEFAULT_DIMENSIONS;
+  }
+
+  if (
+    typeof dimensions !== 'number' ||
+    !Number.isInteger(dimensions) ||
+    !ALLOWED_DIMENSIONS.includes(dimensions)
+  ) {
+    throw new ValidationError(
+      `dimensions must be one of ${ALLOWED_DIMENSIONS.join(', ')}`,
+      'dimensions'
+    );
+  }
+
+  return dimensions;
+}
+
+/**
  * Transforms a client embeddings request into the upstream Yandex request body.
  * @param {object} body client request body (already parsed JSON)
  * @param {string} folderId
  * @returns {object}
- * @throws {ValidationError} when `input` is missing/invalid
+ * @throws {ValidationError} when `input` is missing/invalid or `dimensions` is invalid
  */
 export function buildUpstreamBody(body, folderId) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -129,11 +160,14 @@ export function buildUpstreamBody(body, folderId) {
 
   // normalizeInput validates presence and shape of `input`
   normalizeInput(body.input);
+  // normalizeDimensions validates `dimensions` (absent -> 768)
+  const dimensions = normalizeDimensions(body.dimensions);
 
   return {
     ...body,
     model: yandexModel(folderId),
     encoding_format: 'float',
+    dimensions,
   };
 }
 

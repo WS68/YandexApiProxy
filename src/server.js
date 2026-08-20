@@ -9,6 +9,7 @@
  *   - Authorization: Bearer $YANDEX_API_KEY
  *   - model rewritten to emb://$YANDEX_FOLDER_ID/text-embeddings-v2-doc/latest
  *   - encoding_format forced to "float"
+ *   - dimensions forced to the client value (256/512/768) or 768 if absent
  *
  * Batched inputs (arrays of strings) are fanned out into one upstream call per
  * string and merged back into a single OpenAI-shaped response.
