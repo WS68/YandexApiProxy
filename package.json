@@ -1,0 +1,26 @@
+{
+  "name": "yandex-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible embeddings proxy that forwards requests to the Yandex AI endpoint (https://ai.api.cloud.yandex.net/v1)",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "openai",
+    "yandex",
+    "embeddings",
+    "proxy",
+    "llm"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
