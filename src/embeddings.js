@@ -163,6 +163,8 @@ export async function callUpstream(upstreamBody, config, fetchImpl = globalThis.
     throw new UpstreamNetworkError(`Upstream request failed: ${cause?.message ?? String(err)}`);
   }
 
+  console.log(`[yandex-proxy] yandex status: ${res.status}`);
+
   const rawText = await res.text();
   let json;
   try {

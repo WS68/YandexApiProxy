@@ -41,6 +41,12 @@ function createApp(config) {
 
   app.post(['/v1/embeddings', '/embeddings'], async (req, res) => {
     try {
+      const input = req.body?.input;
+      const inputCount =
+        Array.isArray(input) ? input.length : typeof input === 'string' ? 1 : null;
+      if (inputCount !== null) {
+        console.log(`[yandex-proxy] request: ${inputCount} input string(s)`);
+      }
       const result = await proxyEmbeddings(req.body, config);
       res.json(result);
     } catch (err) {
