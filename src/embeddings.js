@@ -49,6 +49,17 @@ const ALLOWED_DIMENSIONS = [256, 512, 768];
 const RETRY_INITIAL_DELAY_MS = 1_000;
 const RETRY_MAX_DELAY_MS = 60_000;
 
+// Success statistics: aggregate upstream 200 responses into a 1s window and
+// print the total once the window elapses, instead of logging every call.
+const SUCCESS_STATS_WINDOW_MS = 1_000;
+
+// The accumulator lives per request, not per module: createSuccessStats()
+// allocates fresh state for each proxyEmbeddings() call, and that state is
+// threaded through callUpstream() (per-call recording) down to the
+// end-of-request flush. The clock and logger are injectable so the behavior is
+// deterministic under test, and concurrent requests never share or corrupt
+// each other's counters.
+
 /**
  * Builds the config object consumed by createProxy().
  * @param {object} env process.env
@@ -178,13 +189,86 @@ export function buildUpstreamBody(body, folderId) {
 }
 
 /**
+ * Creates a fresh, per-request upstream-success accumulator. Each call to
+ * proxyEmbeddings() allocates its own accumulator and threads it through the
+ * sequential upstream calls, so success statistics never leak across requests.
+ * @returns {{ count: number, windowStart: number | null }}
+ */
+export function createSuccessStats() {
+  return { count: 0, windowStart: null };
+}
+
+/**
+ * Records one successful (HTTP 200) upstream response into the given
+ * per-request accumulator. The first success opens a new aggregation window
+ * silently; further successes within 1s accumulate. Once a success arrives
+ * after the window has been open for more than 1s, the accumulated count is
+ * logged and the window restarts including this response. Zero values are
+ * never printed.
+ *
+ * @param {{ count: number, windowStart: number | null }} stats per-request accumulator from createSuccessStats()
+ * @param {number} [now=Date.now()] current timestamp in ms, injectable for tests
+ * @param {(message: string) => void} [log=console.log] logger, injectable for tests
+ * @returns {void}
+ */
+export function recordUpstreamSuccess(stats, now = Date.now(), log = console.log) {
+  const { count, windowStart } = stats;
+
+  if (windowStart === null) {
+    // First success in a new window: start accumulating without any output.
+    stats.count = 1;
+    stats.windowStart = now;
+    return;
+  }
+
+  if (now - windowStart > SUCCESS_STATS_WINDOW_MS) {
+    // The window elapsed: report what accumulated, then start a fresh window
+    // that already contains this response.
+    log(`[yandex-proxy] yandex ok: ${count} success(es) in ${now - windowStart}ms`);
+    stats.count = 1;
+    stats.windowStart = now;
+    return;
+  }
+
+  stats.count = count + 1;
+}
+
+/**
+ * Flushes the per-request accumulator, reporting any successes that have not
+ * yet been printed (e.g. because the 1s window never elapsed). Called at the
+ * end of each incoming request (including failures). A zero count prints
+ * nothing — the accumulator is simply reset to a fresh state.
+ *
+ * @param {{ count: number, windowStart: number | null }} stats per-request accumulator from createSuccessStats()
+ * @param {number} [now=Date.now()] current timestamp in ms, injectable for tests
+ * @param {(message: string) => void} [log=console.log] logger, injectable for tests
+ * @returns {void}
+ */
+export function flushUpstreamSuccess(stats, now = Date.now(), log = console.log) {
+  const { count, windowStart } = stats;
+  if (count > 0) {
+    log(`[yandex-proxy] yandex ok: ${count} success(es) in ${now - windowStart}ms`);
+  }
+  stats.count = 0;
+  stats.windowStart = null;
+}
+
+/**
  * Runs a single upstream embeddings call and returns the parsed JSON response.
+ * HTTP 200 responses are recorded into the per-request success accumulator
+ * (`stats`); pass `null` to skip accumulation entirely.
  * @param {object} upstreamBody body to send to Yandex
  * @param {object} config
- * @param {typeof fetch} fetchImpl
+ * @param {{ count: number, windowStart: number | null } | null} stats per-request accumulator, or null to skip recording
+ * @param {typeof fetch} [fetchImpl]
  * @returns {Promise<object>}
  */
-export async function callUpstream(upstreamBody, config, fetchImpl = globalThis.fetch) {
+export async function callUpstream(
+  upstreamBody,
+  config,
+  stats = null,
+  fetchImpl = globalThis.fetch
+) {
   const url = `${config.baseUrl}/embeddings`;
 
   let res;
@@ -203,7 +287,16 @@ export async function callUpstream(upstreamBody, config, fetchImpl = globalThis.
     throw new UpstreamNetworkError(`Upstream request failed: ${cause?.message ?? String(err)}`);
   }
 
-  console.log(`[yandex-proxy] yandex status: ${res.status}`);
+  if (res.status === 200) {
+    // Success: accumulate into this request's 1s stats window instead of
+    // logging the call.
+    if (stats) {
+      recordUpstreamSuccess(stats);
+    }
+  } else {
+    // Non-200: keep the per-call status line so errors stay visible immediately.
+    console.log(`[yandex-proxy] yandex status: ${res.status}`);
+  }
 
   const rawText = await res.text();
   let json;
@@ -231,6 +324,7 @@ export async function callUpstream(upstreamBody, config, fetchImpl = globalThis.
  *
  * @param {object} upstreamBody body to send to Yandex
  * @param {object} config
+ * @param {{ count: number, windowStart: number | null } | null} [stats] per-request accumulator, or null to skip recording
  * @param {typeof fetch} [fetchImpl]
  * @param {(ms: number) => Promise<void>} [sleepImpl] delay function, injected for tests
  * @returns {Promise<object>} parsed JSON response
@@ -238,6 +332,7 @@ export async function callUpstream(upstreamBody, config, fetchImpl = globalThis.
 export async function callUpstreamWithRetry(
   upstreamBody,
   config,
+  stats = null,
   fetchImpl = globalThis.fetch,
   sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 ) {
@@ -246,7 +341,7 @@ export async function callUpstreamWithRetry(
 
   for (;;) {
     try {
-      return await callUpstream(upstreamBody, config, fetchImpl);
+      return await callUpstream(upstreamBody, config, stats, fetchImpl);
     } catch (err) {
       if (!(err instanceof UpstreamError) || err.status !== 429) {
         throw err;
@@ -319,6 +414,11 @@ export function mergeResponses(responses) {
  * string, awaiting each response before starting the next, so a batch of N
  * strings takes N sequential calls (order preserved). Each call retries 429s.
  *
+ * Success statistics are accumulated per request: a fresh accumulator is
+ * allocated here, threaded through every upstream call, and flushed (logged)
+ * once when the request finishes — success counters never leak across
+ * concurrent requests.
+ *
  * @param {object} body client request body
  * @param {object} config result of buildConfig()
  * @param {typeof fetch} [fetchImpl]
@@ -328,15 +428,26 @@ export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch
   const upstreamBody = buildUpstreamBody(body, config.folderId);
   const inputs = normalizeInput(body.input);
 
+  // Per-request accumulator: successes from this request's upstream calls are
+  // counted here and reported exactly once when the request ends.
+  const stats = createSuccessStats();
+
   // Sequential loop: one upstream call per input string, awaiting each one.
   const responses = [];
-  for (const text of inputs) {
-    const response = await callUpstreamWithRetry(
-      { ...upstreamBody, input: text },
-      config,
-      fetchImpl
-    );
-    responses.push(response);
+  try {
+    for (const text of inputs) {
+      const response = await callUpstreamWithRetry(
+        { ...upstreamBody, input: text },
+        config,
+        stats,
+        fetchImpl
+      );
+      responses.push(response);
+    }
+  } finally {
+    // Report any successes accumulated since the last window expiry, even if
+    // the request failed part-way through.
+    flushUpstreamSuccess(stats);
   }
 
   return mergeResponses(responses);

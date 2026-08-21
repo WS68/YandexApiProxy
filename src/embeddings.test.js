@@ -11,10 +11,13 @@ import {
   buildUpstreamBody,
   callUpstream,
   callUpstreamWithRetry,
+  flushUpstreamSuccess,
   mergeResponses,
   normalizeDimensions,
   normalizeInput,
   proxyEmbeddings,
+  recordUpstreamSuccess,
+  createSuccessStats,
   UpstreamError,
   UpstreamNetworkError,
   ValidationError,
@@ -196,7 +199,7 @@ test('callUpstream sends the correct URL, headers and body', async () => {
     timeoutMs: 30000,
   };
 
-  await callUpstream({ model: 'm', input: 'x' }, config, fakeFetch);
+  await callUpstream({ model: 'm', input: 'x' }, config, null, fakeFetch);
 
   assert.equal(captured.url, 'https://ai.api.cloud.yandex.net/v1/embeddings');
   assert.equal(captured.opts.method, 'POST');
@@ -210,7 +213,7 @@ test('callUpstream throws UpstreamError with status and body on HTTP error', asy
     jsonResponse(429, { error: { message: 'rate limited' } });
   await assert.rejects(
     () =>
-      callUpstream({}, { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 }, fakeFetch),
+      callUpstream({}, { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 }, null, fakeFetch),
     (err) =>
       err instanceof UpstreamError &&
       err.status === 429 &&
@@ -224,7 +227,7 @@ test('callUpstream throws UpstreamNetworkError when fetch itself fails', async (
   };
   await assert.rejects(
     () =>
-      callUpstream({}, { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 }, fakeFetch),
+      callUpstream({}, { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 }, null, fakeFetch),
     UpstreamNetworkError
   );
 });
@@ -250,6 +253,7 @@ test('callUpstreamWithRetry retries 429 with exponential backoff then succeeds',
   const result = await callUpstreamWithRetry(
     { model: 'm', input: 'x' },
     { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+    null,
     fakeFetch,
     sleepImpl
   );
@@ -275,6 +279,7 @@ test('callUpstreamWithRetry gives up with 429 after 1s,2s,4s,...,60s schedule', 
       callUpstreamWithRetry(
         { model: 'm', input: 'x' },
         { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+        null,
         fakeFetch,
         sleepImpl
       ),
@@ -301,12 +306,176 @@ test('callUpstreamWithRetry does not retry non-429 upstream errors', async () =>
       callUpstreamWithRetry(
         { model: 'm', input: 'x' },
         { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+        null,
         fakeFetch,
         sleepImpl
       ),
     (err) => err instanceof UpstreamError && err.status === 500
   );
   assert.equal(calls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// success statistics (per-request accumulator, 1s window aggregation)
+// ---------------------------------------------------------------------------
+
+test('recordUpstreamSuccess opens a window on first success without logging', () => {
+  const stats = createSuccessStats();
+  const logs = [];
+  recordUpstreamSuccess(stats, 1000, (m) => logs.push(m));
+  recordUpstreamSuccess(stats, 1100, (m) => logs.push(m));
+  assert.deepEqual(logs, []);
+});
+
+test('recordUpstreamSuccess logs the total and resets once the 1s window elapses', () => {
+  const stats = createSuccessStats();
+  const logs = [];
+  recordUpstreamSuccess(stats, 1000, (m) => logs.push(m));
+  recordUpstreamSuccess(stats, 1100, (m) => logs.push(m));
+  recordUpstreamSuccess(stats, 1200, (m) => logs.push(m)); // 200ms — still inside window
+  recordUpstreamSuccess(stats, 2500, (m) => logs.push(m)); // 1500ms — window elapsed
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0], '[yandex-proxy] yandex ok: 3 success(es) in 1500ms');
+});
+
+test('flushUpstreamSuccess prints the pending count and resets the window', () => {
+  const stats = createSuccessStats();
+  const logs = [];
+  recordUpstreamSuccess(stats, 1000, () => {});
+  recordUpstreamSuccess(stats, 1100, () => {});
+  flushUpstreamSuccess(stats, 1500, (m) => logs.push(m));
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0], '[yandex-proxy] yandex ok: 2 success(es) in 500ms');
+
+  // accumulator is fully reset — the next flush prints nothing
+  const moreLogs = [];
+  flushUpstreamSuccess(stats, 2000, (m) => moreLogs.push(m));
+  assert.deepEqual(moreLogs, []);
+});
+
+test('flushUpstreamSuccess with zero count prints nothing', () => {
+  const stats = createSuccessStats();
+  const logs = [];
+  flushUpstreamSuccess(stats, 5000, (m) => logs.push(m));
+  assert.deepEqual(logs, []);
+});
+
+test('per-request accumulators are isolated from each other', () => {
+  const statsA = createSuccessStats();
+  const statsB = createSuccessStats();
+  const logsA = [];
+  const logsB = [];
+
+  recordUpstreamSuccess(statsA, 1000, (m) => logsA.push(m));
+  recordUpstreamSuccess(statsB, 1100, (m) => logsB.push(m));
+  recordUpstreamSuccess(statsA, 1200, (m) => logsA.push(m));
+  recordUpstreamSuccess(statsB, 1300, (m) => logsB.push(m));
+
+  // Each accumulator counts only its own successes.
+  flushUpstreamSuccess(statsA, 1500, (m) => logsA.push(m));
+  flushUpstreamSuccess(statsB, 1500, (m) => logsB.push(m));
+  assert.deepEqual(logsA, ['[yandex-proxy] yandex ok: 2 success(es) in 500ms']);
+  assert.deepEqual(logsB, ['[yandex-proxy] yandex ok: 2 success(es) in 400ms']);
+});
+
+test('callUpstream accumulates 200s silently and keeps the status log for non-200s', async () => {
+  const stats = createSuccessStats();
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (m) => logs.push(m);
+  try {
+    await callUpstream(
+      { model: 'm', input: 'x' },
+      { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+      stats,
+      async () => jsonResponse(200, { data: [], usage: {} })
+    );
+    assert.deepEqual(logs, []);
+
+    await assert.rejects(
+      () =>
+        callUpstream(
+          {},
+          { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
+          stats,
+          async () => jsonResponse(500, { error: { message: 'boom' } })
+        ),
+      (err) => err instanceof UpstreamError && err.status === 500
+    );
+    assert.deepEqual(logs, ['[yandex-proxy] yandex status: 500']);
+
+    // The 200 was accumulated, not logged — the flush reports it exactly once
+    // (window opened at Date.now(); flush uses that same real clock, so the
+    // elapsed time is whatever passed since the 200 — always > 0).
+    const flushLogs = [];
+    flushUpstreamSuccess(stats, Date.now(), (m) => flushLogs.push(m));
+    assert.equal(flushLogs.length, 1);
+    assert.match(flushLogs[0], /^\[yandex-proxy\] yandex ok: 1 success\(es\) in \d+ms$/);
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test('proxyEmbeddings flushes pending success stats on completion', async () => {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (m) => logs.push(m);
+  try {
+    const fakeFetch = async (_url, opts) => {
+      const body = JSON.parse(opts.body);
+      return jsonResponse(200, {
+        data: [{ object: 'embedding', embedding: [1], index: 0 }],
+        usage: { prompt_tokens: 1, total_tokens: 1 },
+        model: body.model,
+      });
+    };
+    await proxyEmbeddings(
+      { model: 'x', input: ['a', 'b', 'c'] },
+      { baseUrl: 'b', apiKey: 'k', folderId: 'f', timeoutMs: 1000 },
+      fakeFetch
+    );
+    // All three 200s are aggregated and reported (exactly once each) by the
+    // end-of-request flush, no matter whether the window elapsed mid-batch.
+    const counts = logs.map((m) => Number((m.match(/yandex ok: (\d+)/) || [])[1] ?? 0));
+    assert.equal(counts.reduce((a, b) => a + b, 0), 3);
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test('proxyEmbeddings flushes pending stats even when the request fails', async () => {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (m) => logs.push(m);
+  try {
+    let calls = 0;
+    const fakeFetch = async (_url, _opts) => {
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse(200, {
+          data: [{ object: 'embedding', embedding: [1], index: 0 }],
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+          model: 'm',
+        });
+      }
+      return jsonResponse(500, { error: { message: 'boom' } });
+    };
+
+    await assert.rejects(
+      () =>
+        proxyEmbeddings(
+          { model: 'x', input: ['a', 'b'] },
+          { baseUrl: 'b', apiKey: 'k', folderId: 'f', timeoutMs: 1000 },
+          fakeFetch
+        ),
+      (err) => err instanceof UpstreamError && err.status === 500
+    );
+    // The single success before the failure is still reported by the flush.
+    const counts = logs.map((m) => Number((m.match(/yandex ok: (\d+)/) || [])[1] ?? 0));
+    assert.equal(counts.reduce((a, b) => a + b, 0), 1);
+  } finally {
+    console.log = originalLog;
+  }
 });
 
 // ---------------------------------------------------------------------------
