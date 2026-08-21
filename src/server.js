@@ -25,6 +25,8 @@ import express from 'express';
 import { pathToFileURL } from 'node:url';
 import {
   buildConfig,
+  logError,
+  logInfo,
   proxyEmbeddings,
   UpstreamError,
   UpstreamNetworkError,
@@ -48,7 +50,7 @@ function createApp(config) {
       const inputCount =
         Array.isArray(input) ? input.length : typeof input === 'string' ? 1 : null;
       if (inputCount !== null) {
-        console.log(`[yandex-proxy] request: ${inputCount} input string(s)`);
+        logInfo(`[yandex-proxy] request: ${inputCount} input string(s)`);
       }
       const result = await proxyEmbeddings(req.body, config);
       res.json(result);
@@ -86,7 +88,7 @@ function createApp(config) {
         return res.status(err.status).json(payload);
       }
 
-      console.error('[yandex-proxy] unexpected error:', err);
+      logError('[yandex-proxy] unexpected error:', err);
       return res.status(500).json({
         error: {
           message: 'Internal server error',
@@ -134,7 +136,7 @@ function createApp(config) {
         },
       });
     }
-    console.error('[yandex-proxy] error:', err);
+    logError('[yandex-proxy] error:', err);
     return res.status(err?.status || 500).json({
       error: {
         message: err?.message || 'Internal server error',
@@ -151,9 +153,9 @@ function createApp(config) {
 export function start(config = buildConfig()) {
   const app = createApp(config);
   return app.listen(PORT, () => {
-    console.log(`[yandex-proxy] listening on http://localhost:${PORT}`);
-    console.log(`[yandex-proxy] forwarding to ${config.baseUrl}/embeddings`);
-    console.log(
+    logInfo(`[yandex-proxy] listening on http://localhost:${PORT}`);
+    logInfo(`[yandex-proxy] forwarding to ${config.baseUrl}/embeddings`);
+    logInfo(
       `[yandex-proxy] model: emb://${config.folderId}/text-embeddings-v2-doc/latest`
     );
   });
@@ -166,7 +168,7 @@ if (isMain) {
   try {
     start();
   } catch (err) {
-    console.error(`[yandex-proxy] failed to start: ${err.message}`);
+    logError(`[yandex-proxy] failed to start: ${err.message}`);
     process.exit(1);
   }
 }

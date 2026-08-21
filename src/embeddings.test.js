@@ -11,13 +11,16 @@ import {
   buildUpstreamBody,
   callUpstream,
   callUpstreamWithRetry,
+  createSuccessStats,
   flushUpstreamSuccess,
+  localTime,
+  logError,
+  logInfo,
   mergeResponses,
   normalizeDimensions,
   normalizeInput,
   proxyEmbeddings,
   recordUpstreamSuccess,
-  createSuccessStats,
   UpstreamError,
   UpstreamNetworkError,
   ValidationError,
@@ -63,6 +66,72 @@ test('yandexModel builds the Yandex document model id', () => {
     yandexModel('b1g7abc'),
     'emb://b1g7abc/text-embeddings-v2-doc/latest'
   );
+});
+
+// ---------------------------------------------------------------------------
+// localTime / logInfo / logError (logging helpers)
+// ---------------------------------------------------------------------------
+
+test('localTime formats HH:mm:ss with zero padding', () => {
+  const date = new Date(2026, 0, 5, 9, 7, 3); // local timezone
+  assert.equal(localTime(date), '09:07:03');
+});
+
+test('localTime pads single-digit hours, minutes and seconds', () => {
+  const date = new Date(2026, 5, 15, 3, 4, 5); // local timezone
+  assert.equal(localTime(date), '03:04:05');
+});
+
+test('localTime defaults to the current local time', () => {
+  const expected = new Date();
+  const got = localTime();
+  const pad = (n) => String(n).padStart(2, '0');
+  assert.equal(
+    got,
+    `${pad(expected.getHours())}:${pad(expected.getMinutes())}:${pad(expected.getSeconds())}`
+  );
+});
+
+test('logInfo inserts a local HH:mm:ss timestamp after the prefix', () => {
+  const originalLog = console.log;
+  const lines = [];
+  console.log = (msg, ...args) => lines.push([msg, ...args]);
+  try {
+    logInfo('[yandex-proxy] request: 1 input string(s)');
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(lines.length, 1);
+  assert.match(lines[0][0], /^\[yandex-proxy\] \d{2}:\d{2}:\d{2} request: 1 input string\(s\)$/);
+});
+
+test('logInfo normalizes a message that already carries the prefix', () => {
+  const originalLog = console.log;
+  const lines = [];
+  console.log = (msg, ...args) => lines.push([msg, ...args]);
+  try {
+    logInfo('[yandex-proxy] listening on http://localhost:9988');
+  } finally {
+    console.log = originalLog;
+  }
+  // The prefix appears exactly once, followed by the timestamp.
+  assert.equal((lines[0][0].match(/\[yandex-proxy\]/g) || []).length, 1);
+  assert.match(lines[0][0], /^\[yandex-proxy\] \d{2}:\d{2}:\d{2} listening on http:\/\/localhost:9988$/);
+});
+
+test('logError forwards extra args to console.error', () => {
+  const originalError = console.error;
+  const lines = [];
+  const sentinel = new Error('boom');
+  console.error = (msg, ...args) => lines.push([msg, ...args]);
+  try {
+    logError('[yandex-proxy] unexpected error:', sentinel);
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(lines.length, 1);
+  assert.match(lines[0][0], /^\[yandex-proxy\] \d{2}:\d{2}:\d{2} unexpected error:$/);
+  assert.equal(lines[0][1], sentinel);
 });
 
 // ---------------------------------------------------------------------------
@@ -402,7 +471,11 @@ test('callUpstream accumulates 200s silently and keeps the status log for non-20
         ),
       (err) => err instanceof UpstreamError && err.status === 500
     );
-    assert.deepEqual(logs, ['[yandex-proxy] yandex status: 500']);
+    assert.equal(logs.length, 1);
+    assert.match(
+      logs[0],
+      /^\[yandex-proxy\] \d{2}:\d{2}:\d{2} yandex status: 500$/
+    );
 
     // The 200 was accumulated, not logged — the flush reports it exactly once
     // (window opened at Date.now(); flush uses that same real clock, so the

@@ -41,6 +41,44 @@ export class ValidationError extends Error {
   }
 }
 
+/**
+ * Formats a date as HH:mm:ss (24-hour, zero-padded) using the process's local
+ * timezone. Shared by every log line so all timestamps use the same format.
+ * Pure and injectable so it can be tested deterministically.
+ * @param {Date} [date=new Date()] instant to format
+ * @returns {string} local time as HH:mm:ss
+ */
+export function localTime(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/**
+ * Prints an info log line with the local time inserted right after the
+ * `[yandex-proxy]` prefix, e.g. `[yandex-proxy] 09:47:22 request: ...`. If the
+ * message already carries the `[yandex-proxy]` prefix it is normalized so the
+ * timestamp is inserted exactly once.
+ * @param {string} message log message (prefix optional)
+ * @param {...unknown} args extra values forwarded to console.log
+ * @returns {void}
+ */
+export function logInfo(message, ...args) {
+  const clean = String(message).replace(/^\[yandex-proxy\]\s*/, '');
+  console.log(`[yandex-proxy] ${localTime()} ${clean}`, ...args);
+}
+
+/**
+ * Prints an error log line with the local time inserted right after the
+ * `[yandex-proxy]` prefix.
+ * @param {string} message log message (prefix optional)
+ * @param {...unknown} args extra values forwarded to console.error
+ * @returns {void}
+ */
+export function logError(message, ...args) {
+  const clean = String(message).replace(/^\[yandex-proxy\]\s*/, '');
+  console.error(`[yandex-proxy] ${localTime()} ${clean}`, ...args);
+}
+
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_DIMENSIONS = 768;
 const ALLOWED_DIMENSIONS = [256, 512, 768];
@@ -208,10 +246,10 @@ export function createSuccessStats() {
  *
  * @param {{ count: number, windowStart: number | null }} stats per-request accumulator from createSuccessStats()
  * @param {number} [now=Date.now()] current timestamp in ms, injectable for tests
- * @param {(message: string) => void} [log=console.log] logger, injectable for tests
+ * @param {(message: string) => void} [log=logInfo] logger, injectable for tests
  * @returns {void}
  */
-export function recordUpstreamSuccess(stats, now = Date.now(), log = console.log) {
+export function recordUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
   const { count, windowStart } = stats;
 
   if (windowStart === null) {
@@ -241,10 +279,10 @@ export function recordUpstreamSuccess(stats, now = Date.now(), log = console.log
  *
  * @param {{ count: number, windowStart: number | null }} stats per-request accumulator from createSuccessStats()
  * @param {number} [now=Date.now()] current timestamp in ms, injectable for tests
- * @param {(message: string) => void} [log=console.log] logger, injectable for tests
+ * @param {(message: string) => void} [log=logInfo] logger, injectable for tests
  * @returns {void}
  */
-export function flushUpstreamSuccess(stats, now = Date.now(), log = console.log) {
+export function flushUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
   const { count, windowStart } = stats;
   if (count > 0) {
     log(`[yandex-proxy] yandex ok: ${count} success(es) in ${now - windowStart}ms`);
@@ -295,7 +333,7 @@ export async function callUpstream(
     }
   } else {
     // Non-200: keep the per-call status line so errors stay visible immediately.
-    console.log(`[yandex-proxy] yandex status: ${res.status}`);
+    logInfo(`[yandex-proxy] yandex status: ${res.status}`);
   }
 
   const rawText = await res.text();
