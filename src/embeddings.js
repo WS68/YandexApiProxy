@@ -80,6 +80,7 @@ export function logError(message, ...args) {
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_BATCH_STRINGS = 1;
 const DEFAULT_DIMENSIONS = 768;
 const ALLOWED_DIMENSIONS = [256, 512, 768];
 const OPENAI_DEFAULT_DIMENSIONS = 1536;
@@ -115,6 +116,14 @@ export function buildConfig(env = process.env, fileConfig = { mode: 'yandex' }) 
   const folderId = (env.YANDEX_FOLDER_ID || '').trim();
   const baseUrl = (fileConfig.baseUrl || (env.YANDEX_BASE_URL || 'https://ai.api.cloud.yandex.net/v1')).replace(/\/+$/, '');
   const timeoutMs = Number.parseInt(env.YANDEX_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS;
+  const hasMaxBatchStrings = Object.prototype.hasOwnProperty.call(fileConfig, 'maxBatchStrings');
+  const maxBatchStrings = hasMaxBatchStrings
+    ? fileConfig.maxBatchStrings
+    : DEFAULT_MAX_BATCH_STRINGS;
+
+  if (!Number.isInteger(maxBatchStrings) || maxBatchStrings < 1) {
+    throw new Error('config maxBatchStrings must be a positive integer');
+  }
 
   if (!apiKey) {
     throw new Error(`Environment variable ${mode === 'openai' ? 'OPENAI_API_KEY' : 'YANDEX_API_KEY'} is required`);
@@ -127,7 +136,7 @@ export function buildConfig(env = process.env, fileConfig = { mode: 'yandex' }) 
     throw new Error('config model is required for openai mode');
   }
 
-  return { mode, apiKey, folderId, baseUrl, model: fileConfig.model, timeoutMs };
+  return { mode, apiKey, folderId, baseUrl, model: fileConfig.model, timeoutMs, maxBatchStrings };
 }
 
 /**
@@ -469,9 +478,9 @@ export function mergeResponses(responses) {
 /**
  * Orchestrates the whole proxy flow for one incoming embeddings request.
  *
- * Processes batched inputs strictly sequentially: one upstream call per input
- * string, awaiting each response before starting the next, so a batch of N
- * strings takes N sequential calls (order preserved). Each call retries 429s.
+ * Processes batched inputs strictly sequentially, splitting them into chunks of
+ * at most `config.maxBatchStrings`. A one-string chunk is sent as a string;
+ * larger chunks are sent as arrays. Each call retries 429s.
  *
  * Success statistics are accumulated per request: a fresh accumulator is
  * allocated here, threaded through every upstream call, and flushed (logged)
@@ -493,10 +502,12 @@ export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch
 
   // Sequential loop: one upstream call per input string, awaiting each one.
   const responses = [];
+  const maxBatchStrings = config.maxBatchStrings ?? DEFAULT_MAX_BATCH_STRINGS;
   try {
-    for (const text of inputs) {
+    for (let offset = 0; offset < inputs.length; offset += maxBatchStrings) {
+      const chunk = inputs.slice(offset, offset + maxBatchStrings);
       const response = await callUpstreamWithRetry(
-        { ...upstreamBody, input: text },
+        { ...upstreamBody, input: chunk.length === 1 ? chunk[0] : chunk },
         config,
         stats,
         fetchImpl

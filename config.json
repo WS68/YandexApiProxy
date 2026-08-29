@@ -1,5 +1,6 @@
 {
   "mode": "openai",
   "baseUrl": "https://routerai.ru/api/v1",
-  "model": "qwen/qwen3-embedding-8b"
+  "model": "qwen/qwen3-embedding-8b",
+  "maxBatchStrings": 1
 }

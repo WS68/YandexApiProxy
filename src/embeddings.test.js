@@ -48,6 +48,7 @@ test('buildConfig reads env vars and applies defaults', () => {
   assert.equal(config.folderId, 'folder-1');
   assert.equal(config.baseUrl, 'https://ai.api.cloud.yandex.net/v1');
   assert.equal(config.timeoutMs, 60000);
+  assert.equal(config.maxBatchStrings, 1);
 });
 
 test('buildConfig honors overrides and trims trailing slash', () => {
@@ -71,6 +72,26 @@ test('buildConfig supports openai mode from file config', () => {
   assert.equal(config.baseUrl, 'https://routerai.ru/api/v1');
   assert.equal(config.model, 'qwen/qwen3-embedding-8b');
   assert.equal(config.timeoutMs, 5000);
+});
+
+test('buildConfig reads a positive maxBatchStrings value from file config', () => {
+  const config = buildConfig(
+    { OPENAI_API_KEY: 'key' },
+    { mode: 'openai', model: 'm', maxBatchStrings: 3 }
+  );
+  assert.equal(config.maxBatchStrings, 3);
+});
+
+test('buildConfig rejects invalid maxBatchStrings values', () => {
+  for (const maxBatchStrings of [0, -1, 1.5, '2', null, true]) {
+    assert.throws(
+      () => buildConfig(
+        { OPENAI_API_KEY: 'key' },
+        { mode: 'openai', model: 'm', maxBatchStrings }
+      ),
+      /maxBatchStrings must be a positive integer/
+    );
+  }
 });
 
 test('yandexModel builds the Yandex document model id', () => {
@@ -703,6 +724,42 @@ test('proxyEmbeddings processes array input sequentially and merges results', as
   assert.equal(result.usage.total_tokens, 6);
   // every upstream call carried the rewritten model
   assert.equal(result.model, 'emb://folder-9/text-embeddings-v2-doc/latest');
+});
+
+test('proxyEmbeddings splits input into configured batches and sends singleton tail as string', async () => {
+  const calls = [];
+  const fakeFetch = async (_url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push(body.input);
+    const items = Array.isArray(body.input) ? body.input : [body.input];
+    return jsonResponse(200, {
+      data: items.map((text, index) => ({
+        object: 'embedding',
+        embedding: [text],
+        index,
+      })),
+      usage: { prompt_tokens: items.length, total_tokens: items.length },
+      model: body.model,
+    });
+  };
+
+  const result = await proxyEmbeddings(
+    { model: 'x', input: ['a', 'b', 'c', 'd', 'e'] },
+    {
+      baseUrl: 'https://b',
+      apiKey: 'k',
+      folderId: 'f',
+      timeoutMs: 1000,
+      maxBatchStrings: 2,
+    },
+    fakeFetch
+  );
+
+  assert.deepEqual(calls, [['a', 'b'], ['c', 'd'], 'e']);
+  assert.deepEqual(result.data.map((item) => item.embedding), [['a'], ['b'], ['c'], ['d'], ['e']]);
+  assert.deepEqual(result.data.map((item) => item.index), [0, 1, 2, 3, 4]);
+  assert.equal(result.usage.prompt_tokens, 5);
+  assert.equal(result.usage.total_tokens, 5);
 });
 
 test('proxyEmbeddings makes strictly sequential upstream calls (no overlap)', async () => {
