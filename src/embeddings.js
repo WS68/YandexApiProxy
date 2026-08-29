@@ -41,6 +41,15 @@ export class ValidationError extends Error {
   }
 }
 
+export class UpstreamResponseError extends Error {
+  constructor(expected, actual) {
+    super(`Upstream response returned ${actual} embedding(s) for ${expected} input string(s)`);
+    this.name = 'UpstreamResponseError';
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
 /**
  * Formats a date as HH:mm:ss (24-hour, zero-padded) using the process's local
  * timezone. Shared by every log line so all timestamps use the same format.
@@ -279,12 +288,21 @@ export function createSuccessStats() {
  * @param {(message: string) => void} [log=logInfo] logger, injectable for tests
  * @returns {void}
  */
-export function recordUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
+export function recordUpstreamSuccess(stats, tokenizedStrings = 1, now = Date.now(), log = logInfo, mode = 'yandex') {
+  // Backward-compatible injectable form: (stats, now, log).
+  if (typeof tokenizedStrings === 'number' && tokenizedStrings >= 1000) {
+    mode = 'yandex';
+    log = typeof now === 'function' ? now : logInfo;
+    now = tokenizedStrings;
+    tokenizedStrings = 1;
+  } else if (typeof tokenizedStrings !== 'number' || tokenizedStrings < 1) {
+    tokenizedStrings = 1;
+  }
   const { count, windowStart } = stats;
 
   if (windowStart === null) {
     // First success in a new window: start accumulating without any output.
-    stats.count = 1;
+    stats.count = tokenizedStrings;
     stats.windowStart = now;
     return;
   }
@@ -292,13 +310,13 @@ export function recordUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
   if (now - windowStart > SUCCESS_STATS_WINDOW_MS) {
     // The window elapsed: report what accumulated, then start a fresh window
     // that already contains this response.
-    log(`[yandex-proxy] yandex ok: ${count} success(es) in ${now - windowStart}ms`);
-    stats.count = 1;
+    log(`[yandex-proxy] ${mode === 'openai' ? 'open api' : 'yandex'} ok: ${count} successfully tokenized string(s) in ${now - windowStart}ms`);
+    stats.count = tokenizedStrings;
     stats.windowStart = now;
     return;
   }
 
-  stats.count = count + 1;
+  stats.count = count + tokenizedStrings;
 }
 
 /**
@@ -312,10 +330,15 @@ export function recordUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
  * @param {(message: string) => void} [log=logInfo] logger, injectable for tests
  * @returns {void}
  */
-export function flushUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
+export function flushUpstreamSuccess(stats, now = Date.now(), log = logInfo, mode = 'yandex') {
+  if (typeof now === 'function') {
+    mode = 'yandex';
+    log = now;
+    now = Date.now();
+  }
   const { count, windowStart } = stats;
   if (count > 0) {
-    log(`[yandex-proxy] yandex ok: ${count} success(es) in ${now - windowStart}ms`);
+    log(`[yandex-proxy] ${mode === 'openai' ? 'open api' : 'yandex'} ok: ${count} successfully tokenized string(s) in ${now - windowStart}ms`);
   }
   stats.count = 0;
   stats.windowStart = null;
@@ -330,6 +353,7 @@ export function flushUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
  * @param {{ count: number, windowStart: number | null } | null} stats per-request accumulator, or null to skip recording
  * @param {typeof fetch} [fetchImpl]
  * @returns {Promise<object>}
+ * @throws {UpstreamError|UpstreamNetworkError|UpstreamResponseError}
  */
 export async function callUpstream(
   upstreamBody,
@@ -358,12 +382,10 @@ export async function callUpstream(
   if (res.status === 200) {
     // Success: accumulate into this request's 1s stats window instead of
     // logging the call.
-    if (stats) {
-      recordUpstreamSuccess(stats);
-    }
+    // Statistics are recorded only after the response cardinality is checked.
   } else {
     // Non-200: keep the per-call status line so errors stay visible immediately.
-    logInfo(`[yandex-proxy] yandex status: ${res.status}`);
+    logInfo(`[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} status: ${res.status}`);
   }
 
   const rawText = await res.text();
@@ -378,7 +400,23 @@ export async function callUpstream(
     throw new UpstreamError(res.status, json);
   }
 
+  const expected = Array.isArray(upstreamBody.input) ? upstreamBody.input.length : 1;
+  const actual = Array.isArray(json?.data) ? json.data.length : 0;
+  if (actual !== expected) {
+    throw new UpstreamResponseError(expected, actual);
+  }
+  if (stats) {
+    recordUpstreamSuccess(stats, expected, Date.now(), logInfo, config.mode);
+  }
+
   return json;
+}
+
+function validateUpstreamResponse(response, expected) {
+  const actual = Array.isArray(response?.data) ? response.data.length : 0;
+  if (actual !== expected) {
+    throw new UpstreamResponseError(expected, actual);
+  }
 }
 
 /**
@@ -503,22 +541,59 @@ export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch
   // Sequential loop: one upstream call per input string, awaiting each one.
   const responses = [];
   const maxBatchStrings = config.maxBatchStrings ?? DEFAULT_MAX_BATCH_STRINGS;
-  try {
-    for (let offset = 0; offset < inputs.length; offset += maxBatchStrings) {
-      const chunk = inputs.slice(offset, offset + maxBatchStrings);
-      const response = await callUpstreamWithRetry(
+
+  const sendBatchWithRecovery = async (chunk) => {
+    let response;
+    try {
+      response = await callUpstreamWithRetry(
         { ...upstreamBody, input: chunk.length === 1 ? chunk[0] : chunk },
         config,
         stats,
         fetchImpl
       );
-      responses.push(response);
+      validateUpstreamResponse(response, chunk.length);
+      return [response];
+    } catch (err) {
+      if (!(err instanceof UpstreamResponseError)) {
+        throw err;
+      }
+    }
+
+    // A cardinality mismatch gets exactly one immediate retry of the same batch.
+    try {
+      response = await callUpstreamWithRetry(
+        { ...upstreamBody, input: chunk.length === 1 ? chunk[0] : chunk },
+        config,
+        stats,
+        fetchImpl
+      );
+      validateUpstreamResponse(response, chunk.length);
+      return [response];
+    } catch (err) {
+      if (!(err instanceof UpstreamResponseError) || chunk.length === 1) {
+        throw err;
+      }
+    }
+
+    // If the batch still cannot be trusted, isolate each string sequentially.
+    const singletonResponses = [];
+    for (const input of chunk) {
+      singletonResponses.push(...await sendBatchWithRecovery([input]));
+    }
+    return singletonResponses;
+  };
+
+  try {
+    for (let offset = 0; offset < inputs.length; offset += maxBatchStrings) {
+      const chunk = inputs.slice(offset, offset + maxBatchStrings);
+      responses.push(...await sendBatchWithRecovery(chunk));
     }
   } finally {
     // Report any successes accumulated since the last window expiry, even if
     // the request failed part-way through.
-    flushUpstreamSuccess(stats);
+    flushUpstreamSuccess(stats, Date.now(), logInfo, config.mode);
   }
 
   return mergeResponses(responses);
 }
+

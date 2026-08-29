@@ -23,6 +23,7 @@ import {
   recordUpstreamSuccess,
   UpstreamError,
   UpstreamNetworkError,
+  UpstreamResponseError,
   ValidationError,
   yandexModel,
 } from './embeddings.js';
@@ -315,7 +316,7 @@ test('callUpstream sends the correct URL, headers and body', async () => {
   let captured;
   const fakeFetch = async (url, opts) => {
     captured = { url, opts };
-    return jsonResponse(200, { data: [], usage: {} });
+    return jsonResponse(200, { data: [{}], usage: {} });
   };
 
   const config = {
@@ -337,7 +338,7 @@ test('callUpstream sends OpenAI-compatible endpoint credentials', async () => {
   let captured;
   const fakeFetch = async (url, opts) => {
     captured = { url, opts };
-    return jsonResponse(200, { data: [], usage: {} });
+    return jsonResponse(200, { data: [{}], usage: {} });
   };
 
   await callUpstream(
@@ -379,6 +380,14 @@ test('callUpstream throws UpstreamNetworkError when fetch itself fails', async (
   );
 });
 
+test('callUpstream rejects a response with the wrong embedding count', async () => {
+  await assert.rejects(
+    () => callUpstream({ input: ['a', 'b'] }, { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 }, null,
+      async () => jsonResponse(200, { data: [{}], usage: {} })),
+    (err) => err instanceof UpstreamResponseError && err.expected === 2 && err.actual === 1
+  );
+});
+
 // ---------------------------------------------------------------------------
 // callUpstreamWithRetry (429 backoff)
 // ---------------------------------------------------------------------------
@@ -391,7 +400,7 @@ test('callUpstreamWithRetry retries 429 with exponential backoff then succeeds',
     if (calls <= 2) {
       return jsonResponse(429, { error: { message: 'rate limited' } });
     }
-    return jsonResponse(200, { data: [], usage: {} });
+    return jsonResponse(200, { data: [{}], usage: {} });
   };
   const sleepImpl = async (ms) => {
     delays.push(ms);
@@ -407,7 +416,7 @@ test('callUpstreamWithRetry retries 429 with exponential backoff then succeeds',
 
   assert.equal(calls, 3);
   assert.deepEqual(delays, [1000, 2000]);
-  assert.deepEqual(result, { data: [], usage: {} });
+  assert.deepEqual(result, { data: [{}], usage: {} });
 });
 
 test('callUpstreamWithRetry gives up with 429 after 1s,2s,4s,...,60s schedule', async () => {
@@ -482,7 +491,7 @@ test('recordUpstreamSuccess logs the total and resets once the 1s window elapses
   recordUpstreamSuccess(stats, 1200, (m) => logs.push(m)); // 200ms — still inside window
   recordUpstreamSuccess(stats, 2500, (m) => logs.push(m)); // 1500ms — window elapsed
   assert.equal(logs.length, 1);
-  assert.equal(logs[0], '[yandex-proxy] yandex ok: 3 success(es) in 1500ms');
+  assert.equal(logs[0], '[yandex-proxy] yandex ok: 3 successfully tokenized string(s) in 1500ms');
 });
 
 test('flushUpstreamSuccess prints the pending count and resets the window', () => {
@@ -492,7 +501,7 @@ test('flushUpstreamSuccess prints the pending count and resets the window', () =
   recordUpstreamSuccess(stats, 1100, () => {});
   flushUpstreamSuccess(stats, 1500, (m) => logs.push(m));
   assert.equal(logs.length, 1);
-  assert.equal(logs[0], '[yandex-proxy] yandex ok: 2 success(es) in 500ms');
+  assert.equal(logs[0], '[yandex-proxy] yandex ok: 2 successfully tokenized string(s) in 500ms');
 
   // accumulator is fully reset — the next flush prints nothing
   const moreLogs = [];
@@ -521,8 +530,8 @@ test('per-request accumulators are isolated from each other', () => {
   // Each accumulator counts only its own successes.
   flushUpstreamSuccess(statsA, 1500, (m) => logsA.push(m));
   flushUpstreamSuccess(statsB, 1500, (m) => logsB.push(m));
-  assert.deepEqual(logsA, ['[yandex-proxy] yandex ok: 2 success(es) in 500ms']);
-  assert.deepEqual(logsB, ['[yandex-proxy] yandex ok: 2 success(es) in 400ms']);
+  assert.deepEqual(logsA, ['[yandex-proxy] yandex ok: 2 successfully tokenized string(s) in 500ms']);
+  assert.deepEqual(logsB, ['[yandex-proxy] yandex ok: 2 successfully tokenized string(s) in 400ms']);
 });
 
 test('callUpstream accumulates 200s silently and keeps the status log for non-200s', async () => {
@@ -535,7 +544,7 @@ test('callUpstream accumulates 200s silently and keeps the status log for non-20
       { model: 'm', input: 'x' },
       { baseUrl: 'b', apiKey: 'k', timeoutMs: 1000 },
       stats,
-      async () => jsonResponse(200, { data: [], usage: {} })
+      async () => jsonResponse(200, { data: [{}], usage: {} })
     );
     assert.deepEqual(logs, []);
 
@@ -552,7 +561,7 @@ test('callUpstream accumulates 200s silently and keeps the status log for non-20
     assert.equal(logs.length, 1);
     assert.match(
       logs[0],
-      /^\[yandex-proxy\] \d{2}:\d{2}:\d{2} yandex status: 500$/
+       /^\[yandex-proxy\] \d{2}:\d{2}:\d{2} yandex status: 500$/
     );
 
     // The 200 was accumulated, not logged — the flush reports it exactly once
@@ -561,7 +570,7 @@ test('callUpstream accumulates 200s silently and keeps the status log for non-20
     const flushLogs = [];
     flushUpstreamSuccess(stats, Date.now(), (m) => flushLogs.push(m));
     assert.equal(flushLogs.length, 1);
-    assert.match(flushLogs[0], /^\[yandex-proxy\] yandex ok: 1 success\(es\) in \d+ms$/);
+    assert.match(flushLogs[0], /^\[yandex-proxy\] yandex ok: 1 successfully tokenized string\(s\) in \d+ms$/);
   } finally {
     console.log = originalLog;
   }
@@ -841,4 +850,38 @@ test('proxyEmbeddings propagates a single upstream failure', async () => {
     () => proxyEmbeddings({ model: 'x', input: ['a', 'b'] }, config, fakeFetch),
     (err) => err instanceof UpstreamError && err.status === 500
   );
+});
+
+test('proxyEmbeddings retries a mismatched batch, then falls back to sequential singletons', async () => {
+  const calls = [];
+  const fakeFetch = async (_url, opts) => {
+    const input = JSON.parse(opts.body).input;
+    calls.push(input);
+    if (calls.length <= 2) return jsonResponse(200, { data: [{}], usage: {} });
+    const text = Array.isArray(input) ? input[0] : input;
+    return jsonResponse(200, { data: [{ embedding: [text] }], usage: { total_tokens: 1 } });
+  };
+  const result = await proxyEmbeddings(
+    { input: ['a', 'b'] },
+    { baseUrl: 'b', apiKey: 'k', folderId: 'f', timeoutMs: 1000, maxBatchStrings: 2 },
+    fakeFetch
+  );
+  assert.deepEqual(calls, [['a', 'b'], ['a', 'b'], 'a', 'b']);
+  assert.deepEqual(result.data.map((item) => item.embedding), [['a'], ['b']]);
+});
+
+test('proxyEmbeddings fails after a singleton cardinality mismatch', async () => {
+  let calls = 0;
+  await assert.rejects(
+    () => proxyEmbeddings(
+      { input: ['a', 'b'] },
+      { baseUrl: 'b', apiKey: 'k', folderId: 'f', timeoutMs: 1000, maxBatchStrings: 2 },
+      async () => {
+        calls += 1;
+        return jsonResponse(200, { data: [], usage: {} });
+      }
+    ),
+    UpstreamResponseError
+  );
+  assert.equal(calls, 4);
 });

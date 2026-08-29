@@ -27,11 +27,13 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   buildConfig,
+  buildUpstreamBody,
   logError,
   logInfo,
   proxyEmbeddings,
   UpstreamError,
   UpstreamNetworkError,
+  UpstreamResponseError,
   ValidationError,
 } from './embeddings.js';
 
@@ -57,7 +59,8 @@ function createApp(config) {
       const inputCount =
         Array.isArray(input) ? input.length : typeof input === 'string' ? 1 : null;
       if (inputCount !== null) {
-        logInfo(`[yandex-proxy] request: ${inputCount} input string(s)`);
+        const dimensions = buildUpstreamBody(req.body, config).dimensions;
+        logInfo(`[yandex-proxy] request: ${inputCount} input string(s), dimensions: ${dimensions}`);
       }
       const result = await proxyEmbeddings(req.body, config);
       res.json(result);
@@ -78,6 +81,17 @@ function createApp(config) {
           error: {
             message: err.message,
             type: 'upstream_network_error',
+            param: null,
+            code: 'upstream_error',
+          },
+        });
+      }
+
+      if (err instanceof UpstreamResponseError) {
+        return res.status(502).json({
+          error: {
+            message: err.message,
+            type: 'upstream_response_error',
             param: null,
             code: 'upstream_error',
           },
