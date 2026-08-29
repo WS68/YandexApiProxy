@@ -22,18 +22,27 @@
  */
 
 import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   buildConfig,
+  buildUpstreamBody,
   logError,
   logInfo,
   proxyEmbeddings,
   UpstreamError,
   UpstreamNetworkError,
+  UpstreamResponseError,
   ValidationError,
 } from './embeddings.js';
 
 const PORT = Number.parseInt(process.env.PORT, 10) || 9988;
+
+function loadFileConfig() {
+  const configPath = path.resolve(process.cwd(), 'config.json');
+  return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+}
 
 function createApp(config) {
   const app = express();
@@ -50,12 +59,14 @@ function createApp(config) {
       const inputCount =
         Array.isArray(input) ? input.length : typeof input === 'string' ? 1 : null;
       if (inputCount !== null) {
-        logInfo(`[yandex-proxy] request: ${inputCount} input string(s)`);
+        const dimensions = buildUpstreamBody(req.body, config).dimensions;
+        logInfo(`[yandex-proxy] request: ${inputCount} input string(s), dimensions: ${dimensions}`);
       }
       const result = await proxyEmbeddings(req.body, config);
       res.json(result);
     } catch (err) {
       if (err instanceof ValidationError) {
+        logError(`[yandex-proxy] invalid client request: ${err.message}; param: ${err.param ?? 'none'}`);
         return res.status(400).json({
           error: {
             message: err.message,
@@ -67,6 +78,7 @@ function createApp(config) {
       }
 
       if (err instanceof UpstreamNetworkError) {
+        logError(`[yandex-proxy] returning 502 for upstream network error: ${err.message}`);
         return res.status(502).json({
           error: {
             message: err.message,
@@ -77,7 +89,20 @@ function createApp(config) {
         });
       }
 
+      if (err instanceof UpstreamResponseError) {
+        logError(`[yandex-proxy] returning 502 for invalid upstream response: ${err.message}`);
+        return res.status(502).json({
+          error: {
+            message: err.message,
+            type: 'upstream_response_error',
+            param: null,
+            code: 'upstream_error',
+          },
+        });
+      }
+
       if (err instanceof UpstreamError) {
+        logError(`[yandex-proxy] forwarding upstream status ${err.status} to client`);
         const body = err.body;
         // Forward the upstream error body verbatim if it already looks like an
         // OpenAI error envelope, otherwise wrap it.
@@ -117,6 +142,7 @@ function createApp(config) {
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => {
     if (err && err.type === 'entity.parse.failed') {
+      logError('[yandex-proxy] invalid JSON request body');
       return res.status(400).json({
         error: {
           message: 'Invalid JSON in request body',
@@ -127,6 +153,7 @@ function createApp(config) {
       });
     }
     if (err && err.type === 'entity.too.large') {
+      logError('[yandex-proxy] request body exceeds 2mb limit');
       return res.status(413).json({
         error: {
           message: 'Request body too large',
@@ -150,14 +177,13 @@ function createApp(config) {
   return app;
 }
 
-export function start(config = buildConfig()) {
+export function start(config = buildConfig(process.env, loadFileConfig())) {
   const app = createApp(config);
   return app.listen(PORT, () => {
     logInfo(`[yandex-proxy] listening on http://localhost:${PORT}`);
+    logInfo(`[yandex-proxy] mode: ${config.mode}`);
     logInfo(`[yandex-proxy] forwarding to ${config.baseUrl}/embeddings`);
-    logInfo(
-      `[yandex-proxy] model: emb://${config.folderId}/text-embeddings-v2-doc/latest`
-    );
+    logInfo(`[yandex-proxy] model: ${config.mode === 'openai' ? config.model : `emb://${config.folderId}/text-embeddings-v2-doc/latest`}`);
   });
 }
 

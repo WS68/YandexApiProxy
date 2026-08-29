@@ -41,6 +41,15 @@ export class ValidationError extends Error {
   }
 }
 
+export class UpstreamResponseError extends Error {
+  constructor(expected, actual) {
+    super(`Upstream response returned ${actual} embedding(s) for ${expected} input string(s)`);
+    this.name = 'UpstreamResponseError';
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
 /**
  * Formats a date as HH:mm:ss (24-hour, zero-padded) using the process's local
  * timezone. Shared by every log line so all timestamps use the same format.
@@ -80,8 +89,11 @@ export function logError(message, ...args) {
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_BATCH_STRINGS = 1;
 const DEFAULT_DIMENSIONS = 768;
 const ALLOWED_DIMENSIONS = [256, 512, 768];
+const OPENAI_DEFAULT_DIMENSIONS = 1536;
+const OPENAI_ALLOWED_DIMENSIONS = [256, 512, 768, 1024, 1536, 2048, 3072, 4096];
 
 // 429 retry schedule: exponential doubling starting at 1s, capped at 60s.
 const RETRY_INITIAL_DELAY_MS = 1_000;
@@ -103,20 +115,37 @@ const SUCCESS_STATS_WINDOW_MS = 1_000;
  * @param {object} env process.env
  * @returns {object}
  */
-export function buildConfig(env = process.env) {
-  const apiKey = (env.YANDEX_API_KEY || '').trim();
+export function buildConfig(env = process.env, fileConfig = { mode: 'yandex' }) {
+  const mode = fileConfig?.mode || 'yandex';
+  if (mode !== 'yandex' && mode !== 'openai') {
+    throw new Error('config mode must be either yandex or openai');
+  }
+
+  const apiKey = (mode === 'openai' ? env.OPENAI_API_KEY : env.YANDEX_API_KEY || '').trim();
   const folderId = (env.YANDEX_FOLDER_ID || '').trim();
-  const baseUrl = (env.YANDEX_BASE_URL || 'https://ai.api.cloud.yandex.net/v1').replace(/\/+$/, '');
+  const baseUrl = (fileConfig.baseUrl || (env.YANDEX_BASE_URL || 'https://ai.api.cloud.yandex.net/v1')).replace(/\/+$/, '');
   const timeoutMs = Number.parseInt(env.YANDEX_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS;
+  const hasMaxBatchStrings = Object.prototype.hasOwnProperty.call(fileConfig, 'maxBatchStrings');
+  const maxBatchStrings = hasMaxBatchStrings
+    ? fileConfig.maxBatchStrings
+    : DEFAULT_MAX_BATCH_STRINGS;
+
+  if (!Number.isInteger(maxBatchStrings) || maxBatchStrings < 1) {
+    throw new Error('config maxBatchStrings must be a positive integer');
+  }
 
   if (!apiKey) {
-    throw new Error('Environment variable YANDEX_API_KEY is required');
+    throw new Error(`Environment variable ${mode === 'openai' ? 'OPENAI_API_KEY' : 'YANDEX_API_KEY'} is required`);
   }
-  if (!folderId) {
+  if (mode === 'yandex' && !folderId) {
     throw new Error('Environment variable YANDEX_FOLDER_ID is required');
   }
 
-  return { apiKey, folderId, baseUrl, timeoutMs };
+  if (mode === 'openai' && !(fileConfig.model || '').trim()) {
+    throw new Error('config model is required for openai mode');
+  }
+
+  return { mode, apiKey, folderId, baseUrl, model: fileConfig.model, timeoutMs, maxBatchStrings };
 }
 
 /**
@@ -208,19 +237,29 @@ export function normalizeDimensions(dimensions) {
  * @returns {object}
  * @throws {ValidationError} when `input` is missing/invalid or `dimensions` is invalid
  */
-export function buildUpstreamBody(body, folderId) {
+export function buildUpstreamBody(body, configOrFolderId) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new ValidationError('request body must be a JSON object', 'body');
   }
 
   // normalizeInput validates presence and shape of `input`
   normalizeInput(body.input);
-  // normalizeDimensions validates `dimensions` (absent -> 768)
-  const dimensions = normalizeDimensions(body.dimensions);
+  const config = typeof configOrFolderId === 'string'
+    ? { mode: 'yandex', folderId: configOrFolderId }
+    : configOrFolderId;
+  const isOpenAI = config?.mode === 'openai';
+  const allowed = isOpenAI ? OPENAI_ALLOWED_DIMENSIONS : ALLOWED_DIMENSIONS;
+  const defaultDimensions = isOpenAI ? OPENAI_DEFAULT_DIMENSIONS : DEFAULT_DIMENSIONS;
+  let dimensions = body.dimensions;
+  if (dimensions === undefined || dimensions === null) {
+    dimensions = defaultDimensions;
+  } else if (typeof dimensions !== 'number' || !Number.isInteger(dimensions) || !allowed.includes(dimensions)) {
+    throw new ValidationError(`dimensions must be one of ${allowed.join(', ')}`, 'dimensions');
+  }
 
   return {
     ...body,
-    model: yandexModel(folderId),
+    model: isOpenAI ? config.model : yandexModel(config.folderId),
     encoding_format: 'float',
     dimensions,
   };
@@ -249,12 +288,21 @@ export function createSuccessStats() {
  * @param {(message: string) => void} [log=logInfo] logger, injectable for tests
  * @returns {void}
  */
-export function recordUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
+export function recordUpstreamSuccess(stats, tokenizedStrings = 1, now = Date.now(), log = logInfo, mode = 'yandex') {
+  // Backward-compatible injectable form: (stats, now, log).
+  if (typeof tokenizedStrings === 'number' && tokenizedStrings >= 1000) {
+    mode = 'yandex';
+    log = typeof now === 'function' ? now : logInfo;
+    now = tokenizedStrings;
+    tokenizedStrings = 1;
+  } else if (typeof tokenizedStrings !== 'number' || tokenizedStrings < 1) {
+    tokenizedStrings = 1;
+  }
   const { count, windowStart } = stats;
 
   if (windowStart === null) {
     // First success in a new window: start accumulating without any output.
-    stats.count = 1;
+    stats.count = tokenizedStrings;
     stats.windowStart = now;
     return;
   }
@@ -262,13 +310,13 @@ export function recordUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
   if (now - windowStart > SUCCESS_STATS_WINDOW_MS) {
     // The window elapsed: report what accumulated, then start a fresh window
     // that already contains this response.
-    log(`[yandex-proxy] yandex ok: ${count} success(es) in ${now - windowStart}ms`);
-    stats.count = 1;
+    log(`[yandex-proxy] ${mode === 'openai' ? 'open api' : 'yandex'} ok: ${count} successfully tokenized string(s) in ${now - windowStart}ms`);
+    stats.count = tokenizedStrings;
     stats.windowStart = now;
     return;
   }
 
-  stats.count = count + 1;
+  stats.count = count + tokenizedStrings;
 }
 
 /**
@@ -282,10 +330,15 @@ export function recordUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
  * @param {(message: string) => void} [log=logInfo] logger, injectable for tests
  * @returns {void}
  */
-export function flushUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
+export function flushUpstreamSuccess(stats, now = Date.now(), log = logInfo, mode = 'yandex') {
+  if (typeof now === 'function') {
+    mode = 'yandex';
+    log = now;
+    now = Date.now();
+  }
   const { count, windowStart } = stats;
   if (count > 0) {
-    log(`[yandex-proxy] yandex ok: ${count} success(es) in ${now - windowStart}ms`);
+    log(`[yandex-proxy] ${mode === 'openai' ? 'open api' : 'yandex'} ok: ${count} successfully tokenized string(s) in ${now - windowStart}ms`);
   }
   stats.count = 0;
   stats.windowStart = null;
@@ -300,6 +353,7 @@ export function flushUpstreamSuccess(stats, now = Date.now(), log = logInfo) {
  * @param {{ count: number, windowStart: number | null } | null} stats per-request accumulator, or null to skip recording
  * @param {typeof fetch} [fetchImpl]
  * @returns {Promise<object>}
+ * @throws {UpstreamError|UpstreamNetworkError|UpstreamResponseError}
  */
 export async function callUpstream(
   upstreamBody,
@@ -322,18 +376,18 @@ export async function callUpstream(
     });
   } catch (err) {
     const cause = err?.cause ?? err;
-    throw new UpstreamNetworkError(`Upstream request failed: ${cause?.message ?? String(err)}`);
+    const message = `Upstream request failed: ${cause?.message ?? String(err)}`;
+    logError(`[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} network error: ${message}`);
+    throw new UpstreamNetworkError(message);
   }
 
   if (res.status === 200) {
     // Success: accumulate into this request's 1s stats window instead of
     // logging the call.
-    if (stats) {
-      recordUpstreamSuccess(stats);
-    }
+    // Statistics are recorded only after the response cardinality is checked.
   } else {
     // Non-200: keep the per-call status line so errors stay visible immediately.
-    logInfo(`[yandex-proxy] yandex status: ${res.status}`);
+    logInfo(`[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} status: ${res.status}`);
   }
 
   const rawText = await res.text();
@@ -345,10 +399,40 @@ export async function callUpstream(
   }
 
   if (!res.ok) {
+    const inputs = Array.isArray(upstreamBody.input) ? upstreamBody.input : [upstreamBody.input];
+    const inputLengths = inputs.map((input) => typeof input === 'string' ? input.length : null);
+    // Status alone cannot distinguish an invalid request shape from a source
+    // chunk that exceeds the provider's per-input limit. Log only metadata
+    // about source text, plus the provider's response, to diagnose failures
+    // without writing indexed source content to the terminal.
+    logError(
+      `[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} rejected upstream batch: status ${res.status}, input string(s): ${inputs.length}, character lengths: ${JSON.stringify(inputLengths)}, response: ${JSON.stringify(json)}`
+    );
     throw new UpstreamError(res.status, json);
   }
 
+  const expected = Array.isArray(upstreamBody.input) ? upstreamBody.input.length : 1;
+  const actual = Array.isArray(json?.data) ? json.data.length : 0;
+  if (actual !== expected) {
+    // Do not print json.data: it contains full embedding vectors. The response
+    // shape is enough to identify provider-side cardinality failures.
+    logError(
+      `[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} invalid upstream response: expected ${expected} embedding(s), received ${actual}, response keys: ${JSON.stringify(Object.keys(json ?? {}))}`
+    );
+    throw new UpstreamResponseError(expected, actual);
+  }
+  if (stats) {
+    recordUpstreamSuccess(stats, expected, Date.now(), logInfo, config.mode);
+  }
+
   return json;
+}
+
+function validateUpstreamResponse(response, expected) {
+  const actual = Array.isArray(response?.data) ? response.data.length : 0;
+  if (actual !== expected) {
+    throw new UpstreamResponseError(expected, actual);
+  }
 }
 
 /**
@@ -448,9 +532,9 @@ export function mergeResponses(responses) {
 /**
  * Orchestrates the whole proxy flow for one incoming embeddings request.
  *
- * Processes batched inputs strictly sequentially: one upstream call per input
- * string, awaiting each response before starting the next, so a batch of N
- * strings takes N sequential calls (order preserved). Each call retries 429s.
+ * Processes batched inputs strictly sequentially, splitting them into chunks of
+ * at most `config.maxBatchStrings`. A one-string chunk is sent as a string;
+ * larger chunks are sent as arrays. Each call retries 429s.
  *
  * Success statistics are accumulated per request: a fresh accumulator is
  * allocated here, threaded through every upstream call, and flushed (logged)
@@ -463,7 +547,7 @@ export function mergeResponses(responses) {
  * @returns {Promise<object>} OpenAI-shaped embeddings response
  */
 export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch) {
-  const upstreamBody = buildUpstreamBody(body, config.folderId);
+  const upstreamBody = buildUpstreamBody(body, config);
   const inputs = normalizeInput(body.input);
 
   // Per-request accumulator: successes from this request's upstream calls are
@@ -472,21 +556,60 @@ export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch
 
   // Sequential loop: one upstream call per input string, awaiting each one.
   const responses = [];
-  try {
-    for (const text of inputs) {
-      const response = await callUpstreamWithRetry(
-        { ...upstreamBody, input: text },
+  const maxBatchStrings = config.maxBatchStrings ?? DEFAULT_MAX_BATCH_STRINGS;
+
+  const sendBatchWithRecovery = async (chunk) => {
+    let response;
+    try {
+      response = await callUpstreamWithRetry(
+        { ...upstreamBody, input: chunk.length === 1 ? chunk[0] : chunk },
         config,
         stats,
         fetchImpl
       );
-      responses.push(response);
+      validateUpstreamResponse(response, chunk.length);
+      return [response];
+    } catch (err) {
+      if (!(err instanceof UpstreamResponseError)) {
+        throw err;
+      }
+    }
+
+    // A cardinality mismatch gets exactly one immediate retry of the same batch.
+    try {
+      response = await callUpstreamWithRetry(
+        { ...upstreamBody, input: chunk.length === 1 ? chunk[0] : chunk },
+        config,
+        stats,
+        fetchImpl
+      );
+      validateUpstreamResponse(response, chunk.length);
+      return [response];
+    } catch (err) {
+      if (!(err instanceof UpstreamResponseError) || chunk.length === 1) {
+        throw err;
+      }
+    }
+
+    // If the batch still cannot be trusted, isolate each string sequentially.
+    const singletonResponses = [];
+    for (const input of chunk) {
+      singletonResponses.push(...await sendBatchWithRecovery([input]));
+    }
+    return singletonResponses;
+  };
+
+  try {
+    for (let offset = 0; offset < inputs.length; offset += maxBatchStrings) {
+      const chunk = inputs.slice(offset, offset + maxBatchStrings);
+      responses.push(...await sendBatchWithRecovery(chunk));
     }
   } finally {
     // Report any successes accumulated since the last window expiry, even if
     // the request failed part-way through.
-    flushUpstreamSuccess(stats);
+    flushUpstreamSuccess(stats, Date.now(), logInfo, config.mode);
   }
 
   return mergeResponses(responses);
 }
+
