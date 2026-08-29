@@ -22,6 +22,8 @@
  */
 
 import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   buildConfig,
@@ -34,6 +36,11 @@ import {
 } from './embeddings.js';
 
 const PORT = Number.parseInt(process.env.PORT, 10) || 9988;
+
+function loadFileConfig() {
+  const configPath = path.resolve(process.cwd(), 'config.json');
+  return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+}
 
 function createApp(config) {
   const app = express();
@@ -150,14 +157,13 @@ function createApp(config) {
   return app;
 }
 
-export function start(config = buildConfig()) {
+export function start(config = buildConfig(process.env, loadFileConfig())) {
   const app = createApp(config);
   return app.listen(PORT, () => {
     logInfo(`[yandex-proxy] listening on http://localhost:${PORT}`);
+    logInfo(`[yandex-proxy] mode: ${config.mode}`);
     logInfo(`[yandex-proxy] forwarding to ${config.baseUrl}/embeddings`);
-    logInfo(
-      `[yandex-proxy] model: emb://${config.folderId}/text-embeddings-v2-doc/latest`
-    );
+    logInfo(`[yandex-proxy] model: ${config.mode === 'openai' ? config.model : `emb://${config.folderId}/text-embeddings-v2-doc/latest`}`);
   });
 }
 

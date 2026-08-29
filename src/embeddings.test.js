@@ -61,6 +61,18 @@ test('buildConfig honors overrides and trims trailing slash', () => {
   assert.equal(config.timeoutMs, 5000);
 });
 
+test('buildConfig supports openai mode from file config', () => {
+  const config = buildConfig(
+    { OPENAI_API_KEY: ' openai-key ', YANDEX_TIMEOUT_MS: '5000' },
+    { mode: 'openai', baseUrl: 'https://routerai.ru/api/v1/', model: 'qwen/qwen3-embedding-8b' }
+  );
+  assert.equal(config.mode, 'openai');
+  assert.equal(config.apiKey, 'openai-key');
+  assert.equal(config.baseUrl, 'https://routerai.ru/api/v1');
+  assert.equal(config.model, 'qwen/qwen3-embedding-8b');
+  assert.equal(config.timeoutMs, 5000);
+});
+
 test('yandexModel builds the Yandex document model id', () => {
   assert.equal(
     yandexModel('b1g7abc'),
@@ -222,6 +234,29 @@ test('buildUpstreamBody injects dimensions 768 by default', () => {
   assert.equal(body.dimensions, 768);
 });
 
+test('buildUpstreamBody uses the OpenAI model and defaults dimensions to 1536', () => {
+  const body = buildUpstreamBody(
+    { model: 'client-model', input: 'a' },
+    { mode: 'openai', model: 'qwen/qwen3-embedding-8b' }
+  );
+  assert.equal(body.model, 'qwen/qwen3-embedding-8b');
+  assert.equal(body.dimensions, 1536);
+  assert.equal(body.encoding_format, 'float');
+});
+
+test('buildUpstreamBody accepts OpenAI dimensions and rejects unsupported values', () => {
+  for (const dimensions of [256, 512, 768, 1024, 1536, 2048, 3072, 4096]) {
+    assert.equal(
+      buildUpstreamBody({ input: 'a', dimensions }, { mode: 'openai', model: 'm' }).dimensions,
+      dimensions
+    );
+  }
+  assert.throws(
+    () => buildUpstreamBody({ input: 'a', dimensions: 5000 }, { mode: 'openai', model: 'm' }),
+    (err) => err instanceof ValidationError && err.param === 'dimensions'
+  );
+});
+
 test('buildUpstreamBody forwards a valid client dimensions value', () => {
   assert.equal(buildUpstreamBody({ input: 'a', dimensions: 256 }, 'f').dimensions, 256);
   assert.equal(buildUpstreamBody({ input: 'a', dimensions: 512 }, 'f').dimensions, 512);
@@ -275,6 +310,28 @@ test('callUpstream sends the correct URL, headers and body', async () => {
   assert.equal(captured.opts.headers['Content-Type'], 'application/json');
   assert.equal(captured.opts.headers.Authorization, 'Bearer secret-key');
   assert.deepEqual(JSON.parse(captured.opts.body), { model: 'm', input: 'x' });
+});
+
+test('callUpstream sends OpenAI-compatible endpoint credentials', async () => {
+  let captured;
+  const fakeFetch = async (url, opts) => {
+    captured = { url, opts };
+    return jsonResponse(200, { data: [], usage: {} });
+  };
+
+  await callUpstream(
+    { model: 'qwen/qwen3-embedding-8b', input: 'x' },
+    { mode: 'openai', baseUrl: 'https://routerai.ru/api/v1', apiKey: 'secret', timeoutMs: 1000 },
+    null,
+    fakeFetch
+  );
+
+  assert.equal(captured.url, 'https://routerai.ru/api/v1/embeddings');
+  assert.equal(captured.opts.headers.Authorization, 'Bearer secret');
+  assert.deepEqual(JSON.parse(captured.opts.body), {
+    model: 'qwen/qwen3-embedding-8b',
+    input: 'x',
+  });
 });
 
 test('callUpstream throws UpstreamError with status and body on HTTP error', async () => {

@@ -82,6 +82,8 @@ export function logError(message, ...args) {
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_DIMENSIONS = 768;
 const ALLOWED_DIMENSIONS = [256, 512, 768];
+const OPENAI_DEFAULT_DIMENSIONS = 1536;
+const OPENAI_ALLOWED_DIMENSIONS = [256, 512, 768, 1024, 1536, 2048, 3072, 4096];
 
 // 429 retry schedule: exponential doubling starting at 1s, capped at 60s.
 const RETRY_INITIAL_DELAY_MS = 1_000;
@@ -103,20 +105,29 @@ const SUCCESS_STATS_WINDOW_MS = 1_000;
  * @param {object} env process.env
  * @returns {object}
  */
-export function buildConfig(env = process.env) {
-  const apiKey = (env.YANDEX_API_KEY || '').trim();
+export function buildConfig(env = process.env, fileConfig = { mode: 'yandex' }) {
+  const mode = fileConfig?.mode || 'yandex';
+  if (mode !== 'yandex' && mode !== 'openai') {
+    throw new Error('config mode must be either yandex or openai');
+  }
+
+  const apiKey = (mode === 'openai' ? env.OPENAI_API_KEY : env.YANDEX_API_KEY || '').trim();
   const folderId = (env.YANDEX_FOLDER_ID || '').trim();
-  const baseUrl = (env.YANDEX_BASE_URL || 'https://ai.api.cloud.yandex.net/v1').replace(/\/+$/, '');
+  const baseUrl = (fileConfig.baseUrl || (env.YANDEX_BASE_URL || 'https://ai.api.cloud.yandex.net/v1')).replace(/\/+$/, '');
   const timeoutMs = Number.parseInt(env.YANDEX_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS;
 
   if (!apiKey) {
-    throw new Error('Environment variable YANDEX_API_KEY is required');
+    throw new Error(`Environment variable ${mode === 'openai' ? 'OPENAI_API_KEY' : 'YANDEX_API_KEY'} is required`);
   }
-  if (!folderId) {
+  if (mode === 'yandex' && !folderId) {
     throw new Error('Environment variable YANDEX_FOLDER_ID is required');
   }
 
-  return { apiKey, folderId, baseUrl, timeoutMs };
+  if (mode === 'openai' && !(fileConfig.model || '').trim()) {
+    throw new Error('config model is required for openai mode');
+  }
+
+  return { mode, apiKey, folderId, baseUrl, model: fileConfig.model, timeoutMs };
 }
 
 /**
@@ -208,19 +219,29 @@ export function normalizeDimensions(dimensions) {
  * @returns {object}
  * @throws {ValidationError} when `input` is missing/invalid or `dimensions` is invalid
  */
-export function buildUpstreamBody(body, folderId) {
+export function buildUpstreamBody(body, configOrFolderId) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new ValidationError('request body must be a JSON object', 'body');
   }
 
   // normalizeInput validates presence and shape of `input`
   normalizeInput(body.input);
-  // normalizeDimensions validates `dimensions` (absent -> 768)
-  const dimensions = normalizeDimensions(body.dimensions);
+  const config = typeof configOrFolderId === 'string'
+    ? { mode: 'yandex', folderId: configOrFolderId }
+    : configOrFolderId;
+  const isOpenAI = config?.mode === 'openai';
+  const allowed = isOpenAI ? OPENAI_ALLOWED_DIMENSIONS : ALLOWED_DIMENSIONS;
+  const defaultDimensions = isOpenAI ? OPENAI_DEFAULT_DIMENSIONS : DEFAULT_DIMENSIONS;
+  let dimensions = body.dimensions;
+  if (dimensions === undefined || dimensions === null) {
+    dimensions = defaultDimensions;
+  } else if (typeof dimensions !== 'number' || !Number.isInteger(dimensions) || !allowed.includes(dimensions)) {
+    throw new ValidationError(`dimensions must be one of ${allowed.join(', ')}`, 'dimensions');
+  }
 
   return {
     ...body,
-    model: yandexModel(folderId),
+    model: isOpenAI ? config.model : yandexModel(config.folderId),
     encoding_format: 'float',
     dimensions,
   };
@@ -463,7 +484,7 @@ export function mergeResponses(responses) {
  * @returns {Promise<object>} OpenAI-shaped embeddings response
  */
 export async function proxyEmbeddings(body, config, fetchImpl = globalThis.fetch) {
-  const upstreamBody = buildUpstreamBody(body, config.folderId);
+  const upstreamBody = buildUpstreamBody(body, config);
   const inputs = normalizeInput(body.input);
 
   // Per-request accumulator: successes from this request's upstream calls are
