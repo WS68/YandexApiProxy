@@ -66,6 +66,7 @@ function createApp(config) {
       res.json(result);
     } catch (err) {
       if (err instanceof ValidationError) {
+        logError(`[yandex-proxy] invalid client request: ${err.message}; param: ${err.param ?? 'none'}`);
         return res.status(400).json({
           error: {
             message: err.message,
@@ -77,6 +78,7 @@ function createApp(config) {
       }
 
       if (err instanceof UpstreamNetworkError) {
+        logError(`[yandex-proxy] returning 502 for upstream network error: ${err.message}`);
         return res.status(502).json({
           error: {
             message: err.message,
@@ -88,6 +90,7 @@ function createApp(config) {
       }
 
       if (err instanceof UpstreamResponseError) {
+        logError(`[yandex-proxy] returning 502 for invalid upstream response: ${err.message}`);
         return res.status(502).json({
           error: {
             message: err.message,
@@ -99,6 +102,7 @@ function createApp(config) {
       }
 
       if (err instanceof UpstreamError) {
+        logError(`[yandex-proxy] forwarding upstream status ${err.status} to client`);
         const body = err.body;
         // Forward the upstream error body verbatim if it already looks like an
         // OpenAI error envelope, otherwise wrap it.
@@ -138,6 +142,7 @@ function createApp(config) {
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => {
     if (err && err.type === 'entity.parse.failed') {
+      logError('[yandex-proxy] invalid JSON request body');
       return res.status(400).json({
         error: {
           message: 'Invalid JSON in request body',
@@ -148,6 +153,7 @@ function createApp(config) {
       });
     }
     if (err && err.type === 'entity.too.large') {
+      logError('[yandex-proxy] request body exceeds 2mb limit');
       return res.status(413).json({
         error: {
           message: 'Request body too large',

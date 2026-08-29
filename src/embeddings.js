@@ -376,7 +376,9 @@ export async function callUpstream(
     });
   } catch (err) {
     const cause = err?.cause ?? err;
-    throw new UpstreamNetworkError(`Upstream request failed: ${cause?.message ?? String(err)}`);
+    const message = `Upstream request failed: ${cause?.message ?? String(err)}`;
+    logError(`[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} network error: ${message}`);
+    throw new UpstreamNetworkError(message);
   }
 
   if (res.status === 200) {
@@ -397,12 +399,26 @@ export async function callUpstream(
   }
 
   if (!res.ok) {
+    const inputs = Array.isArray(upstreamBody.input) ? upstreamBody.input : [upstreamBody.input];
+    const inputLengths = inputs.map((input) => typeof input === 'string' ? input.length : null);
+    // Status alone cannot distinguish an invalid request shape from a source
+    // chunk that exceeds the provider's per-input limit. Log only metadata
+    // about source text, plus the provider's response, to diagnose failures
+    // without writing indexed source content to the terminal.
+    logError(
+      `[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} rejected upstream batch: status ${res.status}, input string(s): ${inputs.length}, character lengths: ${JSON.stringify(inputLengths)}, response: ${JSON.stringify(json)}`
+    );
     throw new UpstreamError(res.status, json);
   }
 
   const expected = Array.isArray(upstreamBody.input) ? upstreamBody.input.length : 1;
   const actual = Array.isArray(json?.data) ? json.data.length : 0;
   if (actual !== expected) {
+    // Do not print json.data: it contains full embedding vectors. The response
+    // shape is enough to identify provider-side cardinality failures.
+    logError(
+      `[yandex-proxy] ${config.mode === 'openai' ? 'open api' : 'yandex'} invalid upstream response: expected ${expected} embedding(s), received ${actual}, response keys: ${JSON.stringify(Object.keys(json ?? {}))}`
+    );
     throw new UpstreamResponseError(expected, actual);
   }
   if (stats) {
