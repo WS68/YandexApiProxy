@@ -121,7 +121,11 @@ export function buildConfig(env = process.env, fileConfig = { mode: 'yandex' }) 
     throw new Error('config mode must be either yandex or openai');
   }
 
-  const apiKey = (mode === 'openai' ? env.OPENAI_API_KEY : env.YANDEX_API_KEY || '').trim();
+  // Note: || binds tighter than the ternary, so the fallback must be applied
+  // after selecting the env var — otherwise openai mode reads env.OPENAI_API_KEY
+  // with no fallback and .trim() throws a TypeError when the key is missing.
+  const rawApiKey = mode === 'openai' ? env.OPENAI_API_KEY : env.YANDEX_API_KEY;
+  const apiKey = (rawApiKey || '').trim();
   const folderId = (env.YANDEX_FOLDER_ID || '').trim();
   const baseUrl = (fileConfig.baseUrl || (env.YANDEX_BASE_URL || 'https://ai.api.cloud.yandex.net/v1')).replace(/\/+$/, '');
   const timeoutMs = Number.parseInt(env.YANDEX_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS;

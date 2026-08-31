@@ -95,6 +95,29 @@ test('buildConfig rejects invalid maxBatchStrings values', () => {
   }
 });
 
+test('buildConfig in openai mode requires OPENAI_API_KEY (no TypeError on missing key)', () => {
+  // Regression: the key expression previously parsed as
+  // `mode === 'openai' ? env.OPENAI_API_KEY : (env.YANDEX_API_KEY || '')`,
+  // so openai mode lost the fallback and .trim() threw a TypeError when the
+  // key was missing, killing startup before the friendly check below ran.
+  assert.throws(
+    () => buildConfig({}, { mode: 'openai', model: 'm' }),
+    /OPENAI_API_KEY is required/
+  );
+  // A present YANDEX_API_KEY must not satisfy the openai-mode requirement.
+  assert.throws(
+    () => buildConfig({ YANDEX_API_KEY: 'yandex-key' }, { mode: 'openai', model: 'm' }),
+    /OPENAI_API_KEY is required/
+  );
+});
+
+test('buildConfig in openai mode trims and rejects whitespace-only OPENAI_API_KEY', () => {
+  assert.throws(
+    () => buildConfig({ OPENAI_API_KEY: '   ' }, { mode: 'openai', model: 'm' }),
+    /OPENAI_API_KEY is required/
+  );
+});
+
 test('yandexModel builds the Yandex document model id', () => {
   assert.equal(
     yandexModel('b1g7abc'),
